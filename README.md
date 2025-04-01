@@ -2,6 +2,14 @@
 
 A monitoring system that connects to WhatsApp and provides automated responses through various integrations.
 
+## Overview
+
+This tool monitors a WhatsApp database for messages with specific tags (`#claude` or `#task`) and responds with:
+- AI-generated answers using the Claude API
+- Task creation in ERPNext
+
+This project is a companion to the [WhatsApp MCP Server](https://github.com/lharries/whatsapp-mcp) and requires it to be installed and running.
+
 ## Features
 
 - **Claude AI Integration**: Monitors for `#claude` messages and uses Claude API to respond with AI-generated answers
@@ -11,10 +19,10 @@ A monitoring system that connects to WhatsApp and provides automated responses t
 
 ## Dependencies
 
-This project **requires** the WhatsApp MCP Server to be installed and running. It depends on:
+This project **requires** the [WhatsApp MCP Server](https://github.com/lharries/whatsapp-mcp) to be installed and running. It depends on:
 
-1. **WhatsApp MCP Server** - Provides the API to send messages to WhatsApp
-2. **WhatsApp Bridge** - Maintains the SQLite database that this tool monitors
+1. **[WhatsApp MCP Server](https://github.com/lharries/whatsapp-mcp)** - Provides the API to send messages to WhatsApp
+2. **WhatsApp Bridge** (included in the MCP repo) - Maintains the SQLite database that this tool monitors
 
 ### Installing the Required Dependencies
 
@@ -22,7 +30,7 @@ Before installing this monitoring tool, you must first set up the WhatsApp MCP S
 
 1. Clone the WhatsApp MCP repository:
 ```bash
-git clone https://github.com/your-username/whatsapp-mcp.git
+git clone https://github.com/lharries/whatsapp-mcp.git
 cd whatsapp-mcp
 ```
 
@@ -44,7 +52,7 @@ cd whatsapp-mcp
 
 1. Clone this repository:
 ```bash
-git clone https://github.com/your-username/whatsapp-monitoring.git
+git clone https://github.com/nkarkare/whatsapp-monitoring.git
 cd whatsapp-monitoring
 ```
 
@@ -210,6 +218,10 @@ MIT
 
 ## Acknowledgements
 
-This project is built on top of WhatsApp MCP Server and uses:
-- Claude AI API for intelligent responses
-- ERPNext for task management
+This project is built on top of [WhatsApp MCP Server](https://github.com/lharries/whatsapp-mcp) by [@lharries](https://github.com/lharries) and uses:
+- [Claude AI API](https://anthropic.com) for intelligent responses
+- [ERPNext](https://erpnext.com) for task management
+
+## Author
+
+Created by [@nkarkare](https://github.com/nkarkare)

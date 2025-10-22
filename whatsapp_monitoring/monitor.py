@@ -31,8 +31,16 @@ from whatsapp_monitoring.config import load_config
 BASE_DIR = Path(__file__).resolve().parent.parent
 CONFIG_DIR = os.path.join(BASE_DIR, "config")
 
+# Load configuration from environment or use defaults
+def get_env_or_default(key, default):
+    return os.environ.get(key, default)
+
 # Setup logging with rotation
-log_file = os.path.join(BASE_DIR, "whatsapp_monitoring.log")
+# Use a log directory in the user's home to avoid permission issues
+log_dir = os.path.expanduser(get_env_or_default("LOG_DIR", "~/.local/share/whatsapp-monitoring/logs"))
+os.makedirs(log_dir, exist_ok=True)
+log_file = os.path.join(log_dir, "whatsapp_monitoring.log")
+
 max_log_size = int(get_env_or_default("MAX_LOG_SIZE_MB", "10")) * 1024 * 1024
 backup_count = int(get_env_or_default("LOG_BACKUP_COUNT", "5"))
 
@@ -48,13 +56,10 @@ logging.basicConfig(
     handlers=[handler, console_handler]
 )
 logger = logging.getLogger("claude_monitor")
+logger.info(f"Logging to: {log_file}")
 
 # Create config directory if it doesn't exist
 os.makedirs(CONFIG_DIR, exist_ok=True)
-
-# Load configuration from environment or use defaults
-def get_env_or_default(key, default):
-    return os.environ.get(key, default)
 
 # Constants
 MESSAGES_DB_PATH = get_env_or_default("MESSAGES_DB_PATH", 
@@ -188,15 +193,15 @@ def get_recent_tagged_messages(last_check_time, tag=CLAUDE_TAG):
         
         # Convert datetime to string for SQLite comparison
         last_check_str = last_check_time.strftime("%Y-%m-%d %H:%M:%S")
-        logger.info(f"Looking for messages after {last_check_str} with tag {tag}")
-        
+        logger.debug(f"Looking for messages after {last_check_str} with tag {tag}")
+
         # Debug: print recent messages with timestamps
         cursor.execute("""
-            SELECT timestamp, content FROM messages 
+            SELECT timestamp, content FROM messages
             ORDER BY timestamp DESC LIMIT 5
         """)
         recent_msgs = cursor.fetchall()
-        logger.info(f"Recent messages in database: {recent_msgs}")
+        logger.debug(f"Recent messages in database: {recent_msgs}")
         
         # Query for tagged messages - handle timezone offset in timestamps
         query = """
@@ -231,9 +236,7 @@ def get_recent_tagged_messages(last_check_time, tag=CLAUDE_TAG):
             if msg_timestamp > last_check_time:
                 messages.append(msg)
         
-        if not messages:
-            logger.info("No new messages found")
-        else:
+        if messages:
             logger.info(f"Found {len(messages)} new messages with {tag} tag")
             for msg in messages:
                 logger.info(f"New message: [{msg[0]}] {msg[3][:50]}...")
@@ -901,24 +904,28 @@ def main():
     try:
         while True:
             try:
+                # Capture the current time at the START of this cycle
+                # This prevents race conditions where messages arrive during processing
+                cycle_start_time = datetime.now()
+
                 # First, check for any confirmation responses
                 check_for_confirmation_responses()
-                
+
                 # Check for task responses
                 check_for_task_responses()
-                
+
                 # Get recent messages with the #claude tag
                 claude_messages = get_recent_tagged_messages(last_check_time, CLAUDE_TAG)
-                
+
                 if claude_messages:
                     # Process each Claude message
                     for message in claude_messages:
                         logger.info(f"Processing Claude request: {message[3][:50]}...")
-                        
+
                         # Extract context count from message
                         context_count = extract_context_count(message[3])
                         logger.info(f"Suggested context count: {context_count}")
-                        
+
                         # Send confirmation request to the user asking for message count
                         confirmation_msg = (
                             f"I found your request for Claude with the #{CLAUDE_TAG} tag.\n\n"
@@ -926,7 +933,7 @@ def main():
                             f"Reply with a number between 1-20, or 'cancel' to abort."
                         )
                         send_whatsapp_response(message[4], confirmation_msg)
-                        
+
                         # Add to pending confirmations with current timestamp
                         pending_confirmations[message[5]] = {
                             'timestamp': datetime.now(),
@@ -934,7 +941,7 @@ def main():
                             'chat_jid': message[4],
                             'tagged_message': message
                         }
-                
+
                 # Get recent messages with the #task tag
                 task_messages = get_recent_tagged_messages(last_check_time, TASK_TAG)
 
@@ -1008,11 +1015,14 @@ def main():
                                     send_whatsapp_response(message[4], error_msg)
                             else:
                                 # Empty message - send help
+                                logger.info("Empty #task message received, sending help template")
                                 send_whatsapp_response(message[4], TASK_HELP_TEMPLATE)
-                        
-                # Update last check time
-                last_check_time = datetime.now()
-                
+
+                # Update last check time to the START of this cycle
+                # This ensures we don't miss messages that arrived during processing
+                last_check_time = cycle_start_time
+                logger.debug(f"Updated last_check_time to {last_check_time}")
+
                 # Sleep before next check
                 time.sleep(POLL_INTERVAL)
                 

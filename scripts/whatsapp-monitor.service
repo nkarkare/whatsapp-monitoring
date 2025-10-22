@@ -1,0 +1,19 @@
+[Unit]
+Description=WhatsApp ERP Task Monitoring Service
+After=network.target
+
+[Service]
+Type=simple
+User=happy
+WorkingDirectory=/home/happy/code/whatsapp-monitoring
+Environment="LOG_DIR=/home/happy/.local/share/whatsapp-monitoring/logs"
+ExecStart=/usr/bin/python3 -m whatsapp_monitoring.cli
+Restart=on-failure
+RestartSec=10
+
+# Security settings
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

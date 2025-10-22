@@ -44,6 +44,10 @@ log_file = os.path.join(log_dir, "whatsapp_monitoring.log")
 max_log_size = int(get_env_or_default("MAX_LOG_SIZE_MB", "10")) * 1024 * 1024
 backup_count = int(get_env_or_default("LOG_BACKUP_COUNT", "5"))
 
+# Get log level from environment (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+log_level_str = get_env_or_default("LOG_LEVEL", "INFO").upper()
+log_level = getattr(logging, log_level_str, logging.INFO)
+
 # Configure rotating file handler
 handler = logging.handlers.RotatingFileHandler(
     log_file, maxBytes=max_log_size, backupCount=backup_count
@@ -51,12 +55,13 @@ handler = logging.handlers.RotatingFileHandler(
 console_handler = logging.StreamHandler()
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=log_level,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[handler, console_handler]
 )
 logger = logging.getLogger("claude_monitor")
 logger.info(f"Logging to: {log_file}")
+logger.info(f"Log level: {log_level_str}")
 
 # Create config directory if it doesn't exist
 os.makedirs(CONFIG_DIR, exist_ok=True)

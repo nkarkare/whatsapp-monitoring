@@ -46,3 +46,6 @@ config/settings.env
 # OS specific files
 .DS_Store
 Thumbs.db
+
+# Claude Flow metrics (auto-generated)
+.claude-flow/metrics/

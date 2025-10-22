@@ -33,8 +33,8 @@ CONFIG_DIR = os.path.join(BASE_DIR, "config")
 
 # Setup logging with rotation
 log_file = os.path.join(BASE_DIR, "whatsapp_monitoring.log")
-max_log_size = 10 * 1024 * 1024  # 10 MB
-backup_count = 5  # Keep 5 backup files
+max_log_size = int(get_env_or_default("MAX_LOG_SIZE_MB", "10")) * 1024 * 1024
+backup_count = int(get_env_or_default("LOG_BACKUP_COUNT", "5"))
 
 # Configure rotating file handler
 handler = logging.handlers.RotatingFileHandler(
@@ -87,6 +87,37 @@ CLAUDE_MODEL = get_env_or_default("CLAUDE_MODEL", "claude-3-opus-20240229")
 ERPNEXT_API_KEY = get_env_or_default("ERPNEXT_API_KEY", "")
 ERPNEXT_API_SECRET = get_env_or_default("ERPNEXT_API_SECRET", "")
 ERPNEXT_URL = get_env_or_default("ERPNEXT_URL", "")
+
+# Message Templates - Configurable via environment variables
+TASK_SUCCESS_EMOJI = get_env_or_default("TASK_SUCCESS_EMOJI", "✅")
+TASK_ERROR_EMOJI = get_env_or_default("TASK_ERROR_EMOJI", "❌")
+TASK_SUCCESS_TEMPLATE = get_env_or_default("TASK_SUCCESS_TEMPLATE",
+    "{emoji} Task created successfully!\n\n"
+    "Task ID: {task_id}\n"
+    "Subject: {subject}\n"
+    "Priority: {priority}\n"
+    "Due Date: {due_date}\n"
+    "Assigned To: {assigned_to}\n\n"
+    "View task: {task_url}")
+TASK_ERROR_TEMPLATE = get_env_or_default("TASK_ERROR_TEMPLATE",
+    "{emoji} Failed to create task in ERP system.\n"
+    "Error: {error}\n\n"
+    "Please check the configuration or contact support.")
+TASK_SIMPLE_SUCCESS_TEMPLATE = get_env_or_default("TASK_SIMPLE_SUCCESS_TEMPLATE",
+    "{emoji} Task created successfully!\n\n"
+    "Task ID: {task_id}\n"
+    "Subject: {subject}\n\n"
+    "View task: {task_url}")
+TASK_HELP_TEMPLATE = get_env_or_default("TASK_HELP_TEMPLATE",
+    "To create a task, use one of these formats:\n\n"
+    "1. Simple: #task Your task description here\n\n"
+    "2. Detailed:\n"
+    "#task\n"
+    "Subject: Task title\n"
+    "Description: Task details\n"
+    "Priority: Low/Medium/High\n"
+    "Due date: YYYY-MM-DD, today, tomorrow, or next week\n"
+    "Assigned To: username or email")
 
 def check_database():
     """Check if the database exists and has the expected tables"""
@@ -906,68 +937,78 @@ def main():
                 
                 # Get recent messages with the #task tag
                 task_messages = get_recent_tagged_messages(last_check_time, TASK_TAG)
-                
+
                 if task_messages:
                     # Process each Task message
                     for message in task_messages:
                         logger.info(f"Processing Task request: {message[3][:50]}...")
-                        
+
                         # Check if the message already contains task details
                         content = message[3]
                         task_details = extract_task_details(content)
-                        
+
                         if task_details.get('has_details', False):
-                            # Task details provided in the message
-                            logger.info("Task details found in the message, proceeding to confirmation")
-                            
-                            # Format confirmation message
-                            subject = task_details.get('subject', 'No subject')
-                            description = task_details.get('description', 'No description')
-                            priority = task_details.get('priority', 'Medium')
-                            due_date = task_details.get('due_date', 'No due date')
-                            assigned_to = task_details.get('assigned_to', 'Unassigned')
-                            
-                            confirmation_msg = (
-                                f"I found the following task details:\n\n"
-                                f"Subject: {subject}\n"
-                                f"Description: {description}\n"
-                                f"Priority: {priority}\n"
-                                f"Due Date: {due_date}\n"
-                                f"Assigned To: {assigned_to}\n\n"
-                                f"Reply with 'confirm' to create this task, or 'cancel' to abort."
-                            )
-                            
-                            send_whatsapp_response(message[4], confirmation_msg)
-                            
-                            # Add to pending tasks with confirmation stage
-                            pending_tasks[message[5]] = {
-                                'timestamp': datetime.now(),
-                                'chat_jid': message[4],
-                                'tagged_message': message,
-                                'task_details': task_details,
-                                'stage': 'confirmation'
-                            }
+                            # Task details provided in the message - create task immediately
+                            logger.info("Task details found in the message, creating task automatically")
+
+                            # Create the task in ERP
+                            result = create_erpnext_task(task_details)
+
+                            if result['success']:
+                                # Send success message with task link
+                                success_msg = TASK_SUCCESS_TEMPLATE.format(
+                                    emoji=TASK_SUCCESS_EMOJI,
+                                    task_id=result.get('task_id', 'Unknown'),
+                                    subject=task_details.get('subject', 'No subject'),
+                                    priority=task_details.get('priority', 'Medium'),
+                                    due_date=task_details.get('due_date', 'Not set'),
+                                    assigned_to=task_details.get('assigned_to', 'Unassigned'),
+                                    task_url=result.get('task_url', '')
+                                )
+                                send_whatsapp_response(message[4], success_msg)
+                            else:
+                                # Send error message
+                                error_msg = TASK_ERROR_TEMPLATE.format(
+                                    emoji=TASK_ERROR_EMOJI,
+                                    error=result.get('error', 'Unknown error')
+                                )
+                                send_whatsapp_response(message[4], error_msg)
                         else:
-                            # Send template for user to fill
-                            template_msg = (
-                                f"I'll help you create a task in ERPNext. Please fill in the following details by replying with the completed template:\n\n"
-                                f"Subject: \n"
-                                f"Description: \n"
-                                f"Priority: (Low/Medium/High)\n"
-                                f"Due date: (YYYY-MM-DD, today, tomorrow, or next week)\n"
-                                f"Assigned To: (username or email)"
-                            )
-                            
-                            send_whatsapp_response(message[4], template_msg)
-                            
-                            # Add to pending tasks with template stage
-                            pending_tasks[message[5]] = {
-                                'timestamp': datetime.now(),
-                                'chat_jid': message[4],
-                                'tagged_message': message,
-                                'task_details': {},
-                                'stage': 'template'
-                            }
+                            # No proper template found - try to extract from plain text
+                            # Remove the #task tag and use the rest as subject
+                            clean_content = re.sub(r'#task\s*', '', content, flags=re.IGNORECASE).strip()
+
+                            if clean_content:
+                                # Use the message content as task subject
+                                simple_task = {
+                                    'subject': clean_content[:200],  # Limit subject length
+                                    'description': clean_content,
+                                    'priority': 'Medium',
+                                    'has_details': True
+                                }
+
+                                logger.info(f"Creating simple task from plain text: {clean_content[:50]}...")
+
+                                # Create the task
+                                result = create_erpnext_task(simple_task)
+
+                                if result['success']:
+                                    success_msg = TASK_SIMPLE_SUCCESS_TEMPLATE.format(
+                                        emoji=TASK_SUCCESS_EMOJI,
+                                        task_id=result.get('task_id', 'Unknown'),
+                                        subject=simple_task['subject'],
+                                        task_url=result.get('task_url', '')
+                                    )
+                                    send_whatsapp_response(message[4], success_msg)
+                                else:
+                                    error_msg = TASK_ERROR_TEMPLATE.format(
+                                        emoji=TASK_ERROR_EMOJI,
+                                        error=result.get('error', 'Unknown error')
+                                    )
+                                    send_whatsapp_response(message[4], error_msg)
+                            else:
+                                # Empty message - send help
+                                send_whatsapp_response(message[4], TASK_HELP_TEMPLATE)
                         
                 # Update last check time
                 last_check_time = datetime.now()

@@ -13,9 +13,14 @@ This project is a companion to the [WhatsApp MCP Server](https://github.com/lhar
 ## Features
 
 - **Claude AI Integration**: Monitors for `#claude` messages and uses Claude API to respond with AI-generated answers
-- **Task Management**: Creates tasks in ERPNext when detecting `#task` messages
-- **Template Support**: Supports filling templates for task creation
-- **Flexible Context**: Allows users to specify how many previous messages to include as context
+- **Automatic Task Creation**: Instantly creates tasks in your ERP system when detecting `#task` messages
+- **Dual Input Modes**:
+  - Simple format: `#task Your task description`
+  - Detailed template: Structured format with Subject, Description, Priority, Due date, and Assignment
+- **Background Service**: Runs continuously as a daemon, checking for new messages every 10 seconds
+- **Instant Feedback**: Sends task ID and clickable link back to WhatsApp immediately after creation
+- **No Confirmation Required**: Tasks are created automatically without user confirmation
+- **Flexible Context**: Allows users to specify how many previous messages to include for AI responses
 
 ## Dependencies
 
@@ -151,18 +156,48 @@ The system will ask how many previous messages to include for context, and then 
 
 ### Task Creation
 
-Send a message with the `#task` tag followed by task details:
+The system **automatically creates tasks** when it detects the `#task` tag. No confirmation required!
 
+#### Simple Format (Quick Tasks)
 ```
-#task 
+#task Review the authentication module pull request
+```
+
+The system will instantly create a task with the message content as the subject.
+
+#### Detailed Format (Complex Tasks)
+```
+#task
 Subject: Schedule team meeting
 Description: Weekly sync-up with the development team
-Priority: Medium
+Priority: High
 Due date: tomorrow
 Assigned To: john.doe@example.com
 ```
 
-The system will create a task in ERPNext and provide a confirmation with the task link.
+The system will create a task with all specified details and send back:
+- ✅ Task ID
+- Direct link to view the task in your ERP system
+- All task details for confirmation
+
+**Date Shortcuts:**
+- `today` - Due date is today
+- `tomorrow` - Due date is tomorrow
+- `next week` - Due date is 7 days from now
+- `YYYY-MM-DD` - Specific date (e.g., 2025-11-15)
+
+**Example Response:**
+```
+✅ Task created successfully!
+
+Task ID: TASK-00123
+Subject: Review authentication module
+Priority: High
+Due Date: 2025-10-23
+Assigned To: developer@company.com
+
+View task: https://erp.company.com/app/task/TASK-00123
+```
 
 ## System Architecture
 

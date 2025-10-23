@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "whatsapp-monitoring": {
+      "command": "python3",
+      "args": [
+        "-m",
+        "whatsapp_monitoring.mcp_server"
+      ],
+      "cwd": "/home/happy/code/whatsapp-monitoring",
+      "env": {
+        "PYTHONPATH": "/home/happy/code/whatsapp-monitoring"
+      }
+    }
+  }
+}

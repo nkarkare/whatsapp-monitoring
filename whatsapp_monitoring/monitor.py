@@ -26,6 +26,8 @@ from pathlib import Path
 
 # Import configuration
 from whatsapp_monitoring.config import load_config
+# Import ERPNext client
+from whatsapp_monitoring.erpnext_client import create_client_from_env
 
 # Define the app directory and config
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -97,6 +99,21 @@ CLAUDE_MODEL = get_env_or_default("CLAUDE_MODEL", "claude-3-opus-20240229")
 ERPNEXT_API_KEY = get_env_or_default("ERPNEXT_API_KEY", "")
 ERPNEXT_API_SECRET = get_env_or_default("ERPNEXT_API_SECRET", "")
 ERPNEXT_URL = get_env_or_default("ERPNEXT_URL", "")
+
+# Initialize ERPNext client (will be set in main)
+_erpnext_client = None
+
+def get_erpnext_client():
+    """Get or create the ERPNext client instance"""
+    global _erpnext_client
+    if _erpnext_client is None:
+        try:
+            _erpnext_client = create_client_from_env()
+            logger.info("ERPNext client initialized successfully")
+        except ValueError as e:
+            logger.error(f"Failed to initialize ERPNext client: {e}")
+            logger.warning("ERPNext functionality will be disabled")
+    return _erpnext_client
 
 # Message Templates - Configurable via environment variables
 TASK_SUCCESS_EMOJI = get_env_or_default("TASK_SUCCESS_EMOJI", "✅")
@@ -441,138 +458,28 @@ def check_for_task_responses():
 
 def create_erpnext_task(task_details):
     """
-    Create a task in ERPNext using the API
-    
+    Create a task in ERPNext using the ERPNextClient
+
     Args:
         task_details: dict containing task data
-        
+
     Returns:
         dict with success flag and task ID or error message
     """
     try:
-        # Prepare API endpoint
-        api_url = f"{ERPNEXT_URL}/api/resource/Task"
-        
-        # Prepare headers
-        headers = {
-            'Authorization': f"token {ERPNEXT_API_KEY}:{ERPNEXT_API_SECRET}",
-            'Content-Type': 'application/json',
-            'Accept': 'application/json'
-        }
-        
-        # Prepare task data
-        task_data = {
-            "doctype": "Task",
-            "subject": task_details.get('subject', 'Task from WhatsApp'),
-            "description": task_details.get('description', ''),
-            "priority": task_details.get('priority', 'Medium'),
-            "status": "Open"
-        }
-        
-        # Add due date if provided
-        if 'due_date' in task_details:
-            task_data["exp_end_date"] = task_details['due_date']
-        
-        # Make the API request to create the task
-        response = requests.post(
-            api_url,
-            headers=headers,
-            json={"data": task_data},
-            timeout=30
-        )
-        
-        if response.status_code in [200, 201]:
-            response_data = response.json()
-            task_id = response_data.get('data', {}).get('name', 'Unknown')
-            logger.info(f"Successfully created task in ERPNext with ID: {task_id}")
-            
-            # Now assign the task if assignee is provided
-            if 'assigned_to' in task_details and task_details['assigned_to']:
-                assign_url = f"{ERPNEXT_URL}/api/method/frappe.desk.form.assign_to.add"
-                
-                # Prepare assignment data
-                assign_data = {
-                    "doctype": "Task",
-                    "name": task_id,
-                    "assign_to": task_details['assigned_to'],
-                    "description": task_details.get('description', "Task from WhatsApp"),
-                    "notify": 1
-                }
-                
-                # Try two different methods to assign the task
-                logger.info(f"Assigning task {task_id} to {task_details['assigned_to']} with URL: {assign_url}")
-                logger.info(f"Assignment data: {json.dumps(assign_data)}")
-                
-                # First method: using the assign_to.add API endpoint
-                try:
-                    # Try a different format for the request - some versions of ERPNext require arrays
-                    alt_assign_data = {
-                        "assign_to": [task_details['assigned_to']],
-                        "doctype": "Task",
-                        "name": task_id,
-                        "description": task_details.get('description', "Task from WhatsApp"),
-                        "notify": 1
-                    }
-                    
-                    assign_response = requests.post(
-                        assign_url,
-                        headers=headers,
-                        json=alt_assign_data,  # Try this format first
-                        timeout=30
-                    )
-                    
-                    logger.info(f"Assignment response status: {assign_response.status_code}")
-                    logger.info(f"Assignment response content: {assign_response.text[:500]}")
-                    
-                    if assign_response.status_code in [200, 201, 202]:
-                        logger.info(f"Successfully assigned task {task_id} to {task_details['assigned_to']}")
-                    else:
-                        logger.error(f"Failed to assign task with method 1: {assign_response.status_code} - {assign_response.text}")
-                        
-                        # Second method: update the _assign field directly
-                        try:
-                            update_url = f"{ERPNEXT_URL}/api/resource/Task/{task_id}"
-                            
-                            # Prepare update data
-                            update_data = {
-                                "_assign": json.dumps([task_details['assigned_to']])
-                            }
-                            
-                            # Make the update request
-                            logger.info(f"Trying alternative assignment method with URL: {update_url}")
-                            logger.info(f"Alternative assignment data: {json.dumps(update_data)}")
-                            
-                            update_response = requests.put(
-                                update_url,
-                                headers=headers,
-                                json={"data": update_data},
-                                timeout=30
-                            )
-                            
-                            logger.info(f"Alternative assignment response status: {update_response.status_code}")
-                            logger.info(f"Alternative assignment response content: {update_response.text[:500]}")
-                            
-                            if update_response.status_code in [200, 201, 202]:
-                                logger.info(f"Successfully assigned task {task_id} to {task_details['assigned_to']} with alternative method")
-                            else:
-                                logger.error(f"Failed to assign task with method 2: {update_response.status_code} - {update_response.text}")
-                        except Exception as e:
-                            logger.error(f"Exception during alternative task assignment: {str(e)}")
-                        
-                except Exception as e:
-                    logger.error(f"Exception during task assignment: {str(e)}")
-            
-            # Generate task URL
-            task_url = f"{ERPNEXT_URL}/app/task/{task_id}"
-            
-            return {"success": True, "task_id": task_id, "task_url": task_url}
-        else:
-            logger.error(f"Failed to create task in ERPNext: {response.status_code} - {response.text}")
-            return {"success": False, "error": f"HTTP {response.status_code}: {response.text}"}
-            
-    except requests.RequestException as e:
-        logger.error(f"Request error with ERPNext API: {e}")
-        return {"success": False, "error": f"Connection error: {str(e)}"}
+        # Get or create ERPNext client
+        client = get_erpnext_client()
+
+        if client is None:
+            logger.error("ERPNext client not available")
+            return {"success": False, "error": "ERPNext client not configured"}
+
+        # Use the ERPNextClient to create the task
+        logger.info(f"Creating task via ERPNextClient: {task_details.get('subject', 'No subject')}")
+        result = client.create_task(task_details)
+
+        return result
+
     except Exception as e:
         logger.error(f"Error creating ERPNext task: {e}")
         return {"success": False, "error": str(e)}

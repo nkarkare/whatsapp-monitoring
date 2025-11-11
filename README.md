@@ -1,17 +1,20 @@
 # WhatsApp Monitoring
 
-A monitoring system that connects to WhatsApp and provides automated responses through various integrations.
+A comprehensive monitoring system that connects to WhatsApp and provides automated responses through various integrations.
 
 ## Overview
 
 This tool monitors a WhatsApp database for messages with specific tags (`#claude` or `#task`) and responds with:
 - AI-generated answers using the Claude API
 - Task creation in ERPNext
+- **NEW**: Daily summaries of group activity
+- **NEW**: Real-time keyword alerts
 
 This project is a companion to the [WhatsApp MCP Server](https://github.com/lharries/whatsapp-mcp) and requires it to be installed and running.
 
 ## Features
 
+### Core Features
 - **Claude AI Integration**: Monitors for `#claude` messages and uses Claude API to respond with AI-generated answers
 - **Automatic Task Creation**: Instantly creates tasks in your ERP system when detecting `#task` messages
 - **Dual Input Modes**:
@@ -21,6 +24,31 @@ This project is a companion to the [WhatsApp MCP Server](https://github.com/lhar
 - **Instant Feedback**: Sends task ID and clickable link back to WhatsApp immediately after creation
 - **No Confirmation Required**: Tasks are created automatically without user confirmation
 - **Flexible Context**: Allows users to specify how many previous messages to include for AI responses
+
+### NEW: Advanced Monitoring Features
+
+#### 📊 Daily Group Summaries
+Receive automated daily summaries of WhatsApp group activity:
+- **Scheduled Reports**: Get summaries at your preferred time (e.g., 9:00 AM daily)
+- **Multi-Group Support**: Monitor multiple groups simultaneously
+- **Rich Statistics**:
+  - Total message count per group
+  - Top 5 most active senders
+  - Time distribution (morning/afternoon/evening/night)
+  - Recent message samples
+- **Timezone Support**: Configure your local timezone for accurate scheduling
+- **Beautiful Formatting**: Professional, emoji-enhanced summaries
+
+#### 🚨 Keyword Monitoring & Alerts
+Get instant alerts when important keywords appear in your groups:
+- **Real-Time Detection**: Monitors messages every 10 seconds
+- **Multiple Keywords**: Track unlimited keywords simultaneously
+- **Flexible Group Selection**: Monitor specific groups or all groups
+- **Smart Cooldown**: Prevents alert spam with configurable cooldown periods
+- **Case-Insensitive**: Matches keywords regardless of case
+- **Word Boundary Detection**: Matches whole words only (e.g., 'help' won't match 'helpful')
+- **Rich Alerts**: Includes sender name, group name, timestamp, and message context
+- **Easy Configuration**: Simple comma-separated list in config
 
 ## Dependencies
 
@@ -88,7 +116,7 @@ WHATSAPP_API_URL=http://localhost:8080/api/send
 
 All configuration is managed through environment variables or the `config/settings.env` file:
 
-```
+```bash
 # WhatsApp Bridge Configuration
 MESSAGES_DB_PATH=/path/to/whatsapp-mcp/whatsapp-bridge/store/messages.db
 WHATSAPP_API_URL=http://localhost:8080/api/send
@@ -108,6 +136,123 @@ CLAUDE_MODEL=claude-3-opus-20240229
 ERPNEXT_API_KEY=your_erpnext_api_key_here
 ERPNEXT_API_SECRET=your_erpnext_api_secret_here
 ERPNEXT_URL=https://your-erpnext-server.com
+```
+
+### NEW: Configuring Daily Summaries & Keyword Monitoring
+
+#### Step 1: Discover Your Group JIDs
+
+First, use the helper script to find your WhatsApp group JIDs:
+
+```bash
+python scripts/list_groups.py
+```
+
+This will display all your groups with their JIDs in a copy-paste friendly format:
+
+```
+📊 Found 3 WhatsApp Groups
+
+1. Family Chat
+   JID: '123456789@g.us'
+
+2. Work Team
+   JID: '987654321@g.us'
+
+3. Friends Group
+   JID: '555555555@g.us'
+
+📋 Copy-Paste Configuration Examples:
+DAILY_SUMMARY_GROUPS='123456789@g.us','987654321@g.us','555555555@g.us'
+```
+
+#### Step 2: Configure in settings.env
+
+Edit your `config/settings.env` (NOT the template file) and add:
+
+```bash
+# ============================================================================
+# Daily Summary Configuration
+# ============================================================================
+
+# Enable daily summary feature
+DAILY_SUMMARY_ENABLED=true
+
+# Time to send summary (24-hour format HH:MM)
+DAILY_SUMMARY_TIME=09:00
+
+# Your phone number to receive summaries (without + prefix)
+DAILY_SUMMARY_RECIPIENT='917498189688'
+
+# Group JIDs to summarize (comma-separated, in quotes)
+DAILY_SUMMARY_GROUPS='123456789@g.us','987654321@g.us'
+
+# Your timezone
+DAILY_SUMMARY_TIMEZONE=Asia/Kolkata
+
+# ============================================================================
+# Keyword Monitoring Configuration
+# ============================================================================
+
+# Enable keyword monitoring
+KEYWORD_MONITORING_ENABLED=true
+
+# Your phone number to receive alerts (without + prefix)
+KEYWORD_ALERT_RECIPIENT='917498189688'
+
+# Keywords to monitor (comma-separated, case-insensitive, in quotes)
+MONITORED_KEYWORDS='urgent','critical','help','emergency','bug'
+
+# Groups to monitor keywords in
+# Use 'all' to monitor all groups, or specific JIDs like daily summary
+MONITORED_GROUPS='all'
+
+# Cooldown between alerts for same keyword (seconds)
+KEYWORD_ALERT_COOLDOWN=300
+```
+
+#### Step 3: Restart the Monitor
+
+```bash
+./run_monitor.sh restart
+```
+
+You should see in the logs:
+
+```
+✓ Daily summary feature enabled
+  Schedule: 09:00 Asia/Kolkata
+  Next run: 2025-01-12 09:00:00+05:30
+
+✓ Keyword monitoring feature enabled
+  Monitoring keywords: urgent, critical, help, emergency, bug
+```
+
+### Configuration Examples
+
+**Example 1: Monitor Only Specific Groups for Summaries**
+```bash
+DAILY_SUMMARY_ENABLED=true
+DAILY_SUMMARY_GROUPS='123456789@g.us','987654321@g.us'
+```
+
+**Example 2: Monitor All Groups for Keywords**
+```bash
+KEYWORD_MONITORING_ENABLED=true
+MONITORED_GROUPS='all'
+MONITORED_KEYWORDS='urgent','help','critical'
+```
+
+**Example 3: Different Recipients for Different Features**
+```bash
+DAILY_SUMMARY_RECIPIENT='917498189688'  # Manager receives summaries
+KEYWORD_ALERT_RECIPIENT='919876543210'   # Admin receives alerts
+```
+
+**Example 4: Disable a Feature**
+```bash
+DAILY_SUMMARY_ENABLED=false  # Disables daily summaries
+KEYWORD_MONITORING_ENABLED=true  # Keeps keyword monitoring enabled
 ```
 
 ## MCP Server Integration (Claude Code)

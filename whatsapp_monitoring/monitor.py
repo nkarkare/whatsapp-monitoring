@@ -22,12 +22,31 @@ import re
 from datetime import datetime, timedelta
 import subprocess
 import sys
+import asyncio
 from pathlib import Path
 
 # Import configuration
 from whatsapp_monitoring.config import load_config
 # Import ERPNext client
 from whatsapp_monitoring.erpnext_client import create_client_from_env
+
+# Import new features (optional - will not break if not available)
+try:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from src.daily_summary import create_from_env as create_daily_summary
+    from src.keyword_monitor import create_from_env as create_keyword_monitor
+    NEW_FEATURES_AVAILABLE = True
+except ImportError:
+    NEW_FEATURES_AVAILABLE = False
+    logging.warning("New features (daily summary, keyword monitoring) not available")
+
+# MCP client for new features
+try:
+    from mcp import ClientSession, StdioServerParameters
+    MCP_AVAILABLE = True
+except ImportError:
+    MCP_AVAILABLE = False
+    logging.warning("MCP not available. New features will be disabled.")
 
 # Define the app directory and config
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -801,18 +820,97 @@ The user is expecting a direct response to the last message in the conversation 
 """
     return system_prompt
 
+async def init_mcp_client():
+    """Initialize WhatsApp MCP client for new features"""
+    if not MCP_AVAILABLE:
+        return None
+
+    try:
+        logger.info("Initializing WhatsApp MCP client...")
+        server_params = StdioServerParameters(
+            command="npx",
+            args=["--yes", "@raaedkabir/whatsapp-mcp-server"],
+            env=os.environ.copy()
+        )
+
+        session = ClientSession(server_params)
+        await session.__aenter__()
+        logger.info("✓ WhatsApp MCP client initialized")
+        return session
+    except Exception as e:
+        logger.error(f"Failed to initialize MCP client: {e}")
+        return None
+
+
+async def check_keywords_async(keyword_monitor, last_check):
+    """Check for keywords in recent messages (async wrapper)"""
+    if keyword_monitor and keyword_monitor.enabled:
+        try:
+            alerts = await keyword_monitor.check_recent_messages(last_check)
+            if alerts > 0:
+                logger.info(f"Sent {alerts} keyword alerts")
+        except Exception as e:
+            logger.error(f"Error in keyword monitoring: {e}")
+
+
 def main():
     logger.info("Starting WhatsApp monitor for Claude and Task requests")
-    
+    logger.info("=" * 60)
+
     # Check the database
     if not check_database():
         logger.error("Database check failed. Exiting.")
         return
+
+    # Initialize new features if available
+    daily_summary = None
+    keyword_monitor = None
+    mcp_client = None
+
+    if NEW_FEATURES_AVAILABLE and MCP_AVAILABLE:
+        logger.info("Initializing new features (daily summary & keyword monitoring)...")
+
+        try:
+            # Initialize MCP client
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            mcp_client = loop.run_until_complete(init_mcp_client())
+
+            if mcp_client:
+                # Create daily summary generator
+                daily_summary = create_daily_summary(mcp_client)
+                if daily_summary and daily_summary.enabled:
+                    daily_summary.start_scheduler()
+                    logger.info("✓ Daily summary feature enabled")
+                else:
+                    logger.info("Daily summary feature disabled")
+
+                # Create keyword monitor
+                keyword_monitor = create_keyword_monitor(mcp_client)
+                if keyword_monitor and keyword_monitor.enabled:
+                    logger.info("✓ Keyword monitoring feature enabled")
+                    logger.info(f"  Monitoring keywords: {', '.join(keyword_monitor.keywords)}")
+                else:
+                    logger.info("Keyword monitoring feature disabled")
+            else:
+                logger.warning("MCP client not available, new features disabled")
+
+        except Exception as e:
+            logger.error(f"Error initializing new features: {e}")
+            logger.info("Continuing with existing features only...")
+    else:
+        if not NEW_FEATURES_AVAILABLE:
+            logger.info("New features not installed (daily summary, keyword monitoring)")
+        if not MCP_AVAILABLE:
+            logger.info("MCP not available, new features disabled")
+
+    logger.info("=" * 60)
     
     # Start with checking messages from the last 5 minutes
     # Use a slightly older timestamp to ensure we don't miss any messages
     last_check_time = datetime.now() - timedelta(minutes=5)
-    
+    keyword_check_time = last_check_time
+
     try:
         while True:
             try:
@@ -825,6 +923,15 @@ def main():
 
                 # Check for task responses
                 check_for_task_responses()
+
+                # Check for keywords (new feature)
+                if keyword_monitor and keyword_monitor.enabled:
+                    try:
+                        loop = asyncio.get_event_loop()
+                        loop.run_until_complete(check_keywords_async(keyword_monitor, keyword_check_time))
+                        keyword_check_time = cycle_start_time
+                    except Exception as e:
+                        logger.error(f"Error in keyword monitoring: {e}")
 
                 # Get recent messages with the #claude tag
                 claude_messages = get_recent_tagged_messages(last_check_time, CLAUDE_TAG)
@@ -937,12 +1044,27 @@ def main():
 
                 # Sleep before next check
                 time.sleep(POLL_INTERVAL)
-                
+
             except Exception as e:
                 logger.error(f"Error in main loop: {e}")
                 time.sleep(POLL_INTERVAL)  # Sleep and try again
     except KeyboardInterrupt:
         logger.info("Monitoring stopped by user")
+    finally:
+        # Cleanup new features
+        if daily_summary and daily_summary.scheduler:
+            logger.info("Stopping daily summary scheduler...")
+            daily_summary.stop_scheduler()
+
+        if mcp_client:
+            logger.info("Closing MCP client...")
+            try:
+                loop = asyncio.get_event_loop()
+                loop.run_until_complete(mcp_client.__aexit__(None, None, None))
+            except Exception as e:
+                logger.error(f"Error closing MCP client: {e}")
+
+        logger.info("Shutdown complete")
 
 if __name__ == "__main__":
     main()

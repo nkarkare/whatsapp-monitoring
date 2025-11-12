@@ -853,9 +853,49 @@ async def check_keywords_async(keyword_monitor, last_check):
             logger.error(f"Error in keyword monitoring: {e}")
 
 
+def ensure_single_instance():
+    """Ensure only one instance of the monitor is running"""
+    import fcntl
+
+    # Create lock file path
+    lock_file_path = os.path.join(BASE_DIR, ".monitor.lock")
+
+    try:
+        # Open lock file
+        lock_file = open(lock_file_path, 'w')
+
+        # Try to acquire exclusive lock (non-blocking)
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+        # Write current PID to lock file
+        lock_file.write(str(os.getpid()))
+        lock_file.flush()
+
+        logger.info(f"✓ Single instance lock acquired (PID: {os.getpid()})")
+        return lock_file  # Keep file open to maintain lock
+
+    except IOError:
+        logger.error("=" * 60)
+        logger.error("❌ Another instance of the monitor is already running!")
+        logger.error("=" * 60)
+        logger.error("")
+        logger.error("To stop the existing instance:")
+        logger.error("  ./run_monitor.sh stop")
+        logger.error("")
+        logger.error("Or manually kill it:")
+        logger.error("  ps aux | grep whatsapp_monitoring")
+        logger.error("  kill <PID>")
+        logger.error("")
+        logger.error("=" * 60)
+        sys.exit(1)
+
+
 def main():
     logger.info("Starting WhatsApp monitor for Claude and Task requests")
     logger.info("=" * 60)
+
+    # Ensure only one instance is running
+    lock_file = ensure_single_instance()
 
     # Check the database
     if not check_database():
@@ -1063,6 +1103,16 @@ def main():
                 loop.run_until_complete(mcp_client.__aexit__(None, None, None))
             except Exception as e:
                 logger.error(f"Error closing MCP client: {e}")
+
+        # Release lock file
+        if 'lock_file' in locals() and lock_file:
+            try:
+                import fcntl
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                lock_file.close()
+                logger.info("✓ Lock released")
+            except Exception as e:
+                logger.debug(f"Error releasing lock: {e}")
 
         logger.info("Shutdown complete")
 

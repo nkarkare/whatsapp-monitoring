@@ -7,9 +7,9 @@ Real-time keyword detection in WhatsApp messages with alerting.
 
 import os
 import logging
-import asyncio
-import json
+import sqlite3
 import re
+import requests
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Set, Optional
 
@@ -19,20 +19,20 @@ logger = logging.getLogger("whatsapp_monitoring.keyword_monitor")
 class KeywordMonitor:
     """Monitors WhatsApp messages for specific keywords and sends alerts"""
 
-    def __init__(self, whatsapp_client, config: Dict[str, Any]):
+    def __init__(self, config: Dict[str, Any]):
         """
         Initialize keyword monitor
 
         Args:
-            whatsapp_client: WhatsApp MCP client session
             config: Configuration dictionary with:
                 - enabled: bool
                 - recipient: str (phone number)
                 - keywords: List[str] (keywords to monitor)
                 - groups: List[str] (group JIDs or 'all')
                 - cooldown: int (seconds between alerts for same keyword)
+                - db_path: str (path to messages database)
+                - api_url: str (WhatsApp API URL)
         """
-        self.whatsapp_client = whatsapp_client
         self.config = config
 
         # Validate configuration
@@ -41,6 +41,8 @@ class KeywordMonitor:
         self.keywords = self._parse_keywords(config.get("keywords", ""))
         self.groups = self._parse_groups(config.get("groups", ""))
         self.cooldown = config.get("cooldown", 300)  # 5 minutes default
+        self.db_path = config.get("db_path", "")
+        self.api_url = config.get("api_url", "")
 
         # Track last alert time per keyword to prevent spam
         self.last_alert_time: Dict[str, datetime] = {}
@@ -150,7 +152,7 @@ class KeywordMonitor:
         """
         self.last_alert_time[keyword] = datetime.now()
 
-    async def get_group_name(self, group_jid: str) -> str:
+    def get_group_name(self, group_jid: str) -> str:
         """
         Get group name from JID with caching
 
@@ -165,21 +167,22 @@ class KeywordMonitor:
             return self.group_name_cache[group_jid]
 
         try:
-            result = await self.whatsapp_client.call_tool(
-                "get_chat",
-                {"chat_jid": group_jid}
-            )
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
 
-            if result and result.content:
-                for content in result.content:
-                    if hasattr(content, 'text'):
-                        data = json.loads(content.text)
-                        name = data.get("name", group_jid)
-                        self.group_name_cache[group_jid] = name
-                        return name
+            cursor.execute("SELECT name FROM chats WHERE jid = ?", (group_jid,))
+            result = cursor.fetchone()
+
+            if result:
+                name = result[0]
+                self.group_name_cache[group_jid] = name
+                return name
 
         except Exception as e:
             logger.error(f"Error getting group name for {group_jid}: {e}")
+        finally:
+            if 'conn' in locals():
+                conn.close()
 
         # Fallback to JID
         self.group_name_cache[group_jid] = group_jid
@@ -244,7 +247,7 @@ class KeywordMonitor:
 
         return "\n".join(lines)
 
-    async def send_alert(self, alert_text: str):
+    def send_alert(self, alert_text: str):
         """
         Send alert via WhatsApp
 
@@ -258,23 +261,22 @@ class KeywordMonitor:
 
             logger.info(f"Sending keyword alert to {self.recipient}")
 
-            result = await self.whatsapp_client.call_tool(
-                "send_message",
-                {
-                    "recipient": self.recipient,
-                    "message": alert_text
-                }
-            )
+            payload = {
+                "recipient": self.recipient,
+                "message": alert_text
+            }
 
-            if result:
+            response = requests.post(self.api_url, json=payload, timeout=10)
+
+            if response.status_code == 200:
                 logger.info("Keyword alert sent successfully")
             else:
-                logger.error("Failed to send keyword alert")
+                logger.error(f"Failed to send keyword alert: HTTP {response.status_code}")
 
         except Exception as e:
             logger.error(f"Error sending keyword alert: {e}")
 
-    async def check_message(self, message: Dict[str, Any]) -> bool:
+    def check_message(self, message: Dict[str, Any]) -> bool:
         """
         Check a message for keywords and send alert if found
 
@@ -287,7 +289,7 @@ class KeywordMonitor:
         try:
             # Get message details
             chat_jid = message.get("chat_jid", "")
-            message_text = message.get("message", "")
+            message_text = message.get("content", "") or message.get("message", "")
 
             # Check if we should monitor this group
             if not chat_jid.endswith("@g.us"):
@@ -307,13 +309,13 @@ class KeywordMonitor:
             for keyword in detected_keywords:
                 if self.can_send_alert(keyword):
                     # Get group name
-                    group_name = await self.get_group_name(chat_jid)
+                    group_name = self.get_group_name(chat_jid)
 
                     # Format alert
                     alert_text = self.format_alert(keyword, message, group_name)
 
                     # Send alert
-                    await self.send_alert(alert_text)
+                    self.send_alert(alert_text)
 
                     # Mark alert sent
                     self.mark_alert_sent(keyword)
@@ -330,7 +332,7 @@ class KeywordMonitor:
             logger.error(f"Error checking message for keywords: {e}")
             return False
 
-    async def check_recent_messages(self, since: datetime) -> int:
+    def check_recent_messages(self, since: datetime) -> int:
         """
         Check recent messages for keywords
 
@@ -342,37 +344,25 @@ class KeywordMonitor:
         """
         try:
             alerts_sent = 0
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
 
             # If monitoring all groups, need to get all groups first
             if self.monitor_all_groups:
-                # Get all chats
-                result = await self.whatsapp_client.call_tool(
-                    "list_chats",
-                    {"limit": 100}
-                )
-
-                if not result or not result.content:
-                    return 0
-
-                # Parse chats
-                chats = []
-                for content in result.content:
-                    if hasattr(content, 'text'):
-                        data = json.loads(content.text)
-                        chats = data.get("chats", [])
-                        break
-
-                # Filter for groups
-                groups_to_check = [chat["jid"] for chat in chats if chat.get("jid", "").endswith("@g.us")]
+                cursor.execute("SELECT jid FROM chats WHERE jid LIKE '%@g.us'")
+                groups_to_check = [row[0] for row in cursor.fetchall()]
             else:
                 groups_to_check = self.groups
 
+            # Convert since to string for SQL
+            since_str = since.strftime("%Y-%m-%d %H:%M:%S")
+
             # Check messages in each group
             for group_jid in groups_to_check:
-                messages = await self._fetch_messages_since(group_jid, since)
+                messages = self._fetch_messages_since(cursor, group_jid, since_str)
 
                 for message in messages:
-                    if await self.check_message(message):
+                    if self.check_message(message):
                         alerts_sent += 1
 
             return alerts_sent
@@ -380,51 +370,62 @@ class KeywordMonitor:
         except Exception as e:
             logger.error(f"Error checking recent messages: {e}")
             return 0
+        finally:
+            if 'conn' in locals():
+                conn.close()
 
-    async def _fetch_messages_since(self, group_jid: str, since: datetime) -> List[Dict[str, Any]]:
+    def _fetch_messages_since(self, cursor, group_jid: str, since_str: str) -> List[Dict[str, Any]]:
         """
         Fetch messages from a group since a specific time
 
         Args:
+            cursor: Database cursor
             group_jid: WhatsApp group JID
-            since: Fetch messages after this timestamp
+            since_str: Timestamp string in format YYYY-MM-DD HH:MM:SS
 
         Returns:
             List of message dictionaries
         """
         try:
-            result = await self.whatsapp_client.call_tool(
-                "list_messages",
-                {
-                    "chat_jid": group_jid,
-                    "after": since.isoformat(),
-                    "limit": 100,
-                    "include_context": False
-                }
-            )
+            query = """
+            SELECT
+                m.timestamp,
+                m.sender,
+                m.content,
+                m.chat_jid,
+                m.id
+            FROM messages m
+            WHERE
+                m.chat_jid = ?
+                AND datetime(substr(m.timestamp, 1, 19)) > datetime(?)
+            ORDER BY m.timestamp ASC
+            LIMIT 100
+            """
 
-            if not result or not result.content:
-                return []
+            cursor.execute(query, (group_jid, since_str))
+            results = cursor.fetchall()
 
-            # Parse response
-            for content in result.content:
-                if hasattr(content, 'text'):
-                    data = json.loads(content.text)
-                    return data.get("messages", [])
+            messages = []
+            for row in results:
+                messages.append({
+                    "timestamp": row[0],
+                    "sender_name": row[1] or "Unknown",
+                    "content": row[2],
+                    "message": row[2],  # Add both for compatibility
+                    "chat_jid": row[3],
+                    "id": row[4]
+                })
 
-            return []
+            return messages
 
         except Exception as e:
             logger.debug(f"Error fetching messages for {group_jid}: {e}")
             return []
 
 
-def create_from_env(whatsapp_client) -> Optional[KeywordMonitor]:
+def create_from_env() -> Optional[KeywordMonitor]:
     """
     Create KeywordMonitor from environment variables
-
-    Args:
-        whatsapp_client: WhatsApp MCP client session
 
     Returns:
         KeywordMonitor instance or None if disabled
@@ -434,7 +435,9 @@ def create_from_env(whatsapp_client) -> Optional[KeywordMonitor]:
         "recipient": os.environ.get("KEYWORD_ALERT_RECIPIENT", ""),
         "keywords": os.environ.get("MONITORED_KEYWORDS", ""),
         "groups": os.environ.get("MONITORED_GROUPS", ""),
-        "cooldown": int(os.environ.get("KEYWORD_ALERT_COOLDOWN", "300"))
+        "cooldown": int(os.environ.get("KEYWORD_ALERT_COOLDOWN", "300")),
+        "db_path": os.environ.get("MESSAGES_DB_PATH", ""),
+        "api_url": os.environ.get("WHATSAPP_API_URL", "http://localhost:8080/api/send")
     }
 
-    return KeywordMonitor(whatsapp_client, config)
+    return KeywordMonitor(config)

@@ -20,6 +20,7 @@ import requests
 import json
 import re
 from datetime import datetime, timedelta
+from typing import List, Dict, Any, Optional
 import subprocess
 import sys
 import asyncio
@@ -33,20 +34,31 @@ from whatsapp_monitoring.erpnext_client import create_client_from_env
 # Import new features (optional - will not break if not available)
 try:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-    from src.daily_summary import create_from_env as create_daily_summary
     from src.keyword_monitor import create_from_env as create_keyword_monitor
-    NEW_FEATURES_AVAILABLE = True
+    KEYWORD_MONITORING_AVAILABLE = True
 except ImportError:
-    NEW_FEATURES_AVAILABLE = False
-    logging.warning("New features (daily summary, keyword monitoring) not available")
+    KEYWORD_MONITORING_AVAILABLE = False
+    logging.warning("Keyword monitoring not available")
 
-# MCP client for new features
+# AI Task Detection feature
 try:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from src.ai_task_detector import create_from_env as create_ai_task_detector
+    AI_TASK_DETECTION_AVAILABLE = True
+except ImportError:
+    AI_TASK_DETECTION_AVAILABLE = False
+    logging.warning("AI task detection not available")
+
+# Daily summary feature (requires MCP)
+try:
+    from src.daily_summary import create_from_env as create_daily_summary
     from mcp import ClientSession, StdioServerParameters
+    DAILY_SUMMARY_AVAILABLE = True
     MCP_AVAILABLE = True
 except ImportError:
+    DAILY_SUMMARY_AVAILABLE = False
     MCP_AVAILABLE = False
-    logging.warning("MCP not available. New features will be disabled.")
+    logging.warning("Daily summary feature not available (requires MCP)")
 
 # Define the app directory and config
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -108,6 +120,13 @@ pending_confirmations = {}
 # Store pending task details
 # Format: {message_id: {'timestamp': datetime, 'chat_jid': str, 'tagged_message': tuple, 'task_details': dict}}
 pending_tasks = {}
+
+# Store pending AI-detected tasks (in-memory cache, synced with database)
+# Format: {message_id: {'timestamp': datetime, 'detection': dict, 'stage': str, 'recipient': str, 'task_num': int}}
+pending_ai_tasks = {}
+
+# Track last processed response timestamp to avoid duplicate processing
+last_ai_response_time = None
 
 # Claude API Configuration - Set these in environment variables for security
 CLAUDE_API_KEY = get_env_or_default("CLAUDE_API_KEY", "")
@@ -827,13 +846,19 @@ async def init_mcp_client():
 
     try:
         logger.info("Initializing WhatsApp MCP client...")
+        from mcp import stdio_client
+
+        # Use stdio_client context manager for proper initialization
         server_params = StdioServerParameters(
             command="npx",
             args=["--yes", "@raaedkabir/whatsapp-mcp-server"],
             env=os.environ.copy()
         )
 
-        session = ClientSession(server_params)
+        # Create client using stdio_client as a context manager
+        stdio_ctx = stdio_client(server_params)
+        read_stream, write_stream = await stdio_ctx.__aenter__()
+        session = ClientSession(read_stream, write_stream)
         await session.__aenter__()
         logger.info("✓ WhatsApp MCP client initialized")
         return session
@@ -842,15 +867,543 @@ async def init_mcp_client():
         return None
 
 
-async def check_keywords_async(keyword_monitor, last_check):
-    """Check for keywords in recent messages (async wrapper)"""
+def get_recent_group_messages(since_time: datetime) -> List[Dict[str, Any]]:
+    """
+    Get recent messages from monitored groups
+
+    Args:
+        since_time: Get messages after this time
+
+    Returns:
+        List of message dictionaries
+    """
+    try:
+        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        cursor = conn.cursor()
+
+        since_str = since_time.strftime("%Y-%m-%d %H:%M:%S")
+
+        # Get recent messages from groups only
+        query = """
+        SELECT
+            m.id,
+            m.timestamp,
+            m.sender,
+            m.content,
+            m.chat_jid,
+            c.name
+        FROM messages m
+        JOIN chats c ON m.chat_jid = c.jid
+        WHERE
+            m.chat_jid LIKE '%@g.us'
+            AND datetime(substr(m.timestamp, 1, 19)) > datetime(?)
+        ORDER BY m.timestamp ASC
+        """
+
+        cursor.execute(query, (since_str,))
+        results = cursor.fetchall()
+
+        messages = []
+        for row in results:
+            messages.append({
+                'id': row[0],
+                'timestamp': row[1],
+                'sender_name': row[2] or 'Unknown',
+                'content': row[3],
+                'message': row[3],  # Compatibility
+                'chat_jid': row[4],
+                'group_name': row[5] or 'Unknown Group'
+            })
+
+        return messages
+
+    except Exception as e:
+        logger.error(f"Error getting recent group messages: {e}")
+        return []
+    finally:
+        if 'conn' in locals():
+            conn.close()
+
+
+def format_ai_detection_confirmation(detection: Dict[str, Any], task_num: int) -> str:
+    """
+    Format AI detection for user confirmation
+
+    Args:
+        detection: Detection result dict
+        task_num: Unique task number for this suggestion
+
+    Returns:
+        Formatted confirmation message
+    """
+    subject = detection.get('subject', 'Untitled Task')
+    message_content = detection.get('original_message', {}).get('content', '')
+    sender_name = detection.get('sender_name', 'Unknown')
+    group_name = detection.get('group_name', 'Unknown Group')
+    confidence = detection.get('confidence', 0)
+    task_type = detection.get('type', 'unknown')
+    priority = detection.get('priority', 'Medium')
+    due_date = detection.get('due_date', None)
+    assignee_mentions = detection.get('assignee_mentions', [])
+
+    # Build confirmation message
+    lines = []
+    lines.append(f"🤖 *Task #{task_num}*")
+    lines.append("")
+    lines.append(f"📋 *Subject:* {subject}")
+    lines.append(f"📝 *Original:* \"{message_content[:150]}{'...' if len(message_content) > 150 else ''}\"")
+    lines.append("")
+    lines.append(f"👤 *Sender:* {sender_name}")
+    lines.append(f"📱 *Group:* {group_name}")
+
+    if assignee_mentions:
+        lines.append(f"👥 *Mentions:* {', '.join(assignee_mentions)}")
+
+    if due_date:
+        lines.append(f"📅 *Due Date:* {due_date}")
+
+    lines.append(f"⚡ *Priority:* {priority}")
+    lines.append(f"🏷️ *Type:* {task_type}")
+    lines.append(f"🎯 *AI Confidence:* {confidence}%")
+    lines.append("")
+    lines.append("─" * 30)
+    lines.append(f"Reply *'{task_num}'* to create | *'no {task_num}'* to skip")
+
+    return "\n".join(lines)
+
+
+def check_keywords(keyword_monitor, last_check):
+    """Check for keywords in recent messages"""
     if keyword_monitor and keyword_monitor.enabled:
         try:
-            alerts = await keyword_monitor.check_recent_messages(last_check)
+            alerts = keyword_monitor.check_recent_messages(last_check)
             if alerts > 0:
                 logger.info(f"Sent {alerts} keyword alerts")
         except Exception as e:
             logger.error(f"Error in keyword monitoring: {e}")
+
+
+def check_ai_task_responses(ai_detector):
+    """Check for responses to AI-detected task suggestions"""
+    global pending_ai_tasks, last_ai_response_time
+
+    try:
+        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        cursor = conn.cursor()
+
+        # Load pending suggestions from database (handles session restarts)
+        if ai_detector.learning_engine:
+            db_suggestions = ai_detector.learning_engine.get_pending_suggestions()
+            for sugg in db_suggestions:
+                msg_id = sugg['message_id']
+                if msg_id not in pending_ai_tasks:
+                    # Reload from database
+                    pending_ai_tasks[msg_id] = {
+                        'timestamp': datetime.strptime(sugg['created_at'], "%Y-%m-%d %H:%M:%S") if sugg.get('created_at') else datetime.now(),
+                        'detection': sugg['detection'],
+                        'stage': 'initial',
+                        'recipient': os.environ.get("KEYWORD_ALERT_RECIPIENT", "").strip("'\""),
+                        'task_num': sugg['task_num']
+                    }
+
+        if not pending_ai_tasks:
+            return
+
+        # Get the earliest timestamp from pending tasks
+        earliest_time = min(data['timestamp'] for data in pending_ai_tasks.values())
+        since_time = earliest_time.strftime("%Y-%m-%d %H:%M:%S")
+
+        # Use last_ai_response_time if set (to avoid reprocessing same responses)
+        if last_ai_response_time:
+            since_time = max(since_time, last_ai_response_time)
+
+        # Get any recipient to check (they should all be the same)
+        recipient = list(pending_ai_tasks.values())[0]['recipient']
+
+        # Query for recent messages from the recipient (user's responses)
+        # Only get responses NEWER than since_time to avoid duplicates
+        query = """
+        SELECT m.content, m.timestamp
+        FROM messages m
+        WHERE
+            m.sender LIKE ?
+            AND datetime(substr(m.timestamp, 1, 19)) > datetime(?)
+        ORDER BY m.timestamp ASC
+        LIMIT 10
+        """
+
+        # Match on recipient number
+        cursor.execute(query, (f"%{recipient.replace('91', '')}%", since_time))
+        responses = cursor.fetchall()
+
+        if not responses:
+            return
+
+        # Process each response
+        to_approve = []
+        to_reject = []
+
+        for response_content, response_timestamp in responses:
+            # Update last processed time to avoid reprocessing this response
+            last_ai_response_time = response_timestamp
+            response = response_content.strip().lower()
+
+            # Check for "all" responses
+            if response in ['all', 'yes all', 'create all']:
+                # Approve all pending tasks
+                for msg_id, data in pending_ai_tasks.items():
+                    if data.get('stage') == 'initial':
+                        to_approve.append((msg_id, data))
+                logger.info(f"User approved ALL {len(to_approve)} pending tasks")
+                break
+
+            elif response in ['no all', 'skip all', 'reject all', 'none']:
+                # Reject all pending tasks
+                for msg_id, data in pending_ai_tasks.items():
+                    if data.get('stage') == 'initial':
+                        to_reject.append((msg_id, data))
+                logger.info(f"User rejected ALL {len(to_reject)} pending tasks")
+                break
+
+            # Check for specific task number (e.g., "3" or "yes 3" or "create 3")
+            num_match = re.match(r'^(?:yes\s+|create\s+|ok\s+)?(\d+)$', response)
+            if num_match:
+                task_num = int(num_match.group(1))
+                # Find the task with this number
+                for msg_id, data in pending_ai_tasks.items():
+                    if data.get('task_num') == task_num and data.get('stage') == 'initial':
+                        if (msg_id, data) not in to_approve:
+                            to_approve.append((msg_id, data))
+                            logger.info(f"User approved task #{task_num}")
+                        break
+
+            # Check for rejection of specific task (e.g., "no 3" or "skip 3")
+            reject_match = re.match(r'^(?:no|skip|reject)\s+(\d+)$', response)
+            if reject_match:
+                task_num = int(reject_match.group(1))
+                for msg_id, data in pending_ai_tasks.items():
+                    if data.get('task_num') == task_num and data.get('stage') == 'initial':
+                        if (msg_id, data) not in to_reject:
+                            to_reject.append((msg_id, data))
+                            logger.info(f"User rejected task #{task_num}")
+                        break
+
+            # Check for multiple numbers (e.g., "1,3,5" or "1 3 5")
+            multi_match = re.match(r'^[\d,\s]+$', response)
+            if multi_match and len(response) > 1:
+                nums = [int(n) for n in re.findall(r'\d+', response)]
+                for task_num in nums:
+                    for msg_id, data in pending_ai_tasks.items():
+                        if data.get('task_num') == task_num and data.get('stage') == 'initial':
+                            if (msg_id, data) not in to_approve:
+                                to_approve.append((msg_id, data))
+                                logger.info(f"User approved task #{task_num}")
+                            break
+
+        # Process approved tasks
+        for msg_id, data in to_approve:
+            task_id = process_ai_task_approval(data, ai_detector)
+            # Update database status
+            if ai_detector.learning_engine:
+                ai_detector.learning_engine.update_suggestion_status(msg_id, 'approved', task_id)
+            if msg_id in pending_ai_tasks:
+                del pending_ai_tasks[msg_id]
+
+        # Process rejected tasks
+        for msg_id, data in to_reject:
+            process_ai_task_rejection(data, ai_detector)
+            # Update database status
+            if ai_detector.learning_engine:
+                ai_detector.learning_engine.update_suggestion_status(msg_id, 'rejected')
+            if msg_id in pending_ai_tasks:
+                del pending_ai_tasks[msg_id]
+
+    except Exception as e:
+        logger.error(f"Error checking AI task responses: {e}")
+    finally:
+        if 'conn' in locals():
+            conn.close()
+
+
+def process_ai_task_approval(data: Dict, ai_detector):
+    """
+    Process approved AI task creation
+
+    Args:
+        data: Pending task data
+        ai_detector: AI detector instance
+    """
+    try:
+        detection = data['detection']
+        recipient = data['recipient']
+
+        # Record positive feedback
+        if ai_detector and ai_detector.learning_engine:
+            ai_detector.record_feedback(detection, user_approved=True)
+
+        # Extract task details from AI analysis
+        subject = detection.get('subject', 'Task from AI detection')
+        description = detection.get('description', '')
+        original_message = detection.get('original_message', {})
+        message_content = original_message.get('content', '')
+        sender_name = detection.get('sender_name', 'Unknown')
+        group_name = detection.get('group_name', 'Unknown')
+        timestamp = detection.get('timestamp', '')
+
+        # Build full description with context
+        full_description = f"""{subject}
+
+Original message: "{message_content}"
+
+Group: {group_name}
+Sender: {sender_name}
+Time: {timestamp}
+
+AI Analysis:
+- Type: {detection.get('type', 'unknown')}
+- Priority: {detection.get('priority', 'Medium')}
+- Confidence: {detection.get('confidence', 0)}%
+"""
+
+        # Prepare task details
+        task_details = {
+            'subject': subject[:200],  # Limit subject length
+            'description': full_description,
+            'priority': detection.get('priority', 'Medium'),
+            'has_details': True
+        }
+
+        # Add due date if detected
+        due_date = detection.get('due_date')
+        if due_date:
+            task_details['due_date'] = due_date
+
+        # Check for assignee mentions
+        assignee_mentions = detection.get('assignee_mentions', [])
+        if assignee_mentions:
+            # Try to resolve first mentioned person
+            first_mention = assignee_mentions[0]
+            send_whatsapp_response(
+                recipient,
+                f"Looking up assignee '{first_mention}' in ERPNext..."
+            )
+
+            # Try to search ERPNext for this person
+            erpnext_client = get_erpnext_client()
+            if erpnext_client:
+                try:
+                    # Check learning database first
+                    if ai_detector and ai_detector.learning_engine:
+                        cached_email = ai_detector.learning_engine.get_assignee_mapping(first_mention)
+                        if cached_email:
+                            logger.info(f"Found cached assignee mapping: {first_mention} -> {cached_email}")
+                            task_details['assigned_to'] = cached_email
+                        else:
+                            # Search ERPNext
+                            users = erpnext_client.search_users(first_mention, ['name', 'email', 'full_name'])
+                            if users and len(users) == 1:
+                                # Single match - use it
+                                task_details['assigned_to'] = users[0].get('email')
+                                # Save mapping for future
+                                if ai_detector and ai_detector.learning_engine:
+                                    ai_detector.learning_engine.save_assignee_mapping(
+                                        first_mention,
+                                        users[0].get('email')
+                                    )
+                                logger.info(f"Auto-assigned to {users[0].get('full_name')} ({users[0].get('email')})")
+                                send_whatsapp_response(
+                                    recipient,
+                                    f"✓ Assigned to {users[0].get('full_name')}"
+                                )
+                            elif users and len(users) > 1:
+                                # Multiple matches - notify user
+                                user_list = "\n".join([f"  • {u.get('full_name')} ({u.get('email')})" for u in users[:5]])
+                                send_whatsapp_response(
+                                    recipient,
+                                    f"⚠️ Multiple users found for '{first_mention}':\n{user_list}\n\nPlease reply with the correct email to assign, or I'll create without assignment."
+                                )
+                            else:
+                                # No users found - ask user for help
+                                send_whatsapp_response(
+                                    recipient,
+                                    f"❌ User '{first_mention}' not found in ERPNext.\n\nPlease reply with their email address to assign the task, or I'll create it unassigned."
+                                )
+                except Exception as e:
+                    logger.error(f"Error searching for assignee: {e}")
+
+        # Create task in ERPNext
+        logger.info(f"Creating AI-detected task: {subject}")
+        result = create_erpnext_task(task_details)
+
+        if result.get('success'):
+            # Success message
+            task_id = result.get('task_id', 'Unknown')
+            task_url = result.get('task_url', '')
+            assignee = task_details.get('assigned_to', 'Unassigned')
+
+            success_msg = f"""✅ AI Task created successfully!
+
+📋 Task ID: {task_id}
+📝 Subject: {subject}
+👤 Assigned To: {assignee}
+⚡ Priority: {detection.get('priority', 'Medium')}
+📅 Due: {due_date or 'Not set'}
+
+View task: {task_url}
+
+🤖 AI Confidence: {detection.get('confidence')}%
+"""
+            send_whatsapp_response(recipient, success_msg)
+
+            return task_id
+
+        else:
+            # Error message
+            error = result.get('error', 'Unknown error')
+            send_whatsapp_response(
+                recipient,
+                f"❌ Failed to create task: {error}"
+            )
+            return None
+
+    except Exception as e:
+        logger.error(f"Error processing AI task approval: {e}")
+        return None
+
+
+def process_ai_task_rejection(data: Dict, ai_detector):
+    """
+    Process rejected AI task creation
+
+    Args:
+        data: Pending task data
+        ai_detector: AI detector instance
+    """
+    try:
+        detection = data['detection']
+        recipient = data['recipient']
+
+        # Record negative feedback
+        if ai_detector and ai_detector.learning_engine:
+            ai_detector.record_feedback(detection, user_approved=False)
+
+        # Send confirmation
+        send_whatsapp_response(
+            recipient,
+            "✓ Task suggestion ignored. AI will learn from this feedback."
+        )
+
+        logger.info(f"AI task rejected - recorded as learning example")
+
+    except Exception as e:
+        logger.error(f"Error processing AI task rejection: {e}")
+
+
+def check_mcp_server_running():
+    """Check if the WhatsApp MCP server is running"""
+    import socket
+
+    # Check if port 8080 is open (WhatsApp Bridge API)
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(2)
+        result = sock.connect_ex(('localhost', 8080))
+        sock.close()
+
+        if result == 0:
+            logger.info("✓ WhatsApp Bridge API is accessible on port 8080")
+            return True
+    except Exception as e:
+        logger.debug(f"Could not connect to port 8080: {e}")
+
+    # Alternative: Check for the whatsapp-client process
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", "whatsapp-client"],
+            capture_output=True,
+            text=True
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            logger.info("✓ WhatsApp client process is running")
+            return True
+    except Exception as e:
+        logger.debug(f"Could not check for whatsapp-client process: {e}")
+
+    return False
+
+
+def start_mcp_server():
+    """Start the WhatsApp MCP server if it's not running"""
+    logger.info("Starting WhatsApp Bridge server...")
+
+    try:
+        # Use the whatsapp-bridge directory
+        bridge_dir = os.path.join(os.path.dirname(BASE_DIR), 'whatsapp-mcp', 'whatsapp-bridge')
+        client_binary = os.path.join(bridge_dir, 'whatsapp-client')
+
+        if os.path.exists(client_binary):
+            logger.info(f"Starting WhatsApp Bridge from: {bridge_dir}")
+            # Start the Go binary in the background
+            process = subprocess.Popen(
+                [client_binary],
+                cwd=bridge_dir,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True
+            )
+            logger.info(f"Started WhatsApp Bridge process (PID: {process.pid})")
+        else:
+            logger.error(f"WhatsApp client binary not found at: {client_binary}")
+            logger.info("Please build the WhatsApp Bridge:")
+            logger.info(f"  cd {bridge_dir}")
+            logger.info("  go build -o whatsapp-client")
+            return False
+
+        # Wait a few seconds for the server to start
+        logger.info("Waiting for WhatsApp Bridge to initialize...")
+        time.sleep(5)
+
+        # Verify it started
+        if check_mcp_server_running():
+            logger.info("✓ WhatsApp Bridge started successfully")
+            return True
+        else:
+            logger.warning("⚠ WhatsApp Bridge may not have started properly")
+            return False
+
+    except Exception as e:
+        logger.error(f"Failed to start WhatsApp Bridge: {e}")
+        return False
+
+
+def ensure_mcp_server():
+    """Ensure the WhatsApp Bridge server is running, start it if needed"""
+    logger.info("Checking WhatsApp Bridge server status...")
+
+    if check_mcp_server_running():
+        logger.info("✓ WhatsApp Bridge is already running")
+        return True
+
+    logger.warning("WhatsApp Bridge is not running")
+
+    # Try to start it
+    if start_mcp_server():
+        return True
+    else:
+        logger.error("=" * 60)
+        logger.error("❌ Failed to start WhatsApp Bridge!")
+        logger.error("=" * 60)
+        logger.error("")
+        logger.error("Please start the WhatsApp Bridge manually:")
+        logger.error("  cd ../whatsapp-mcp/whatsapp-bridge")
+        logger.error("  ./whatsapp-client")
+        logger.error("")
+        logger.error("Or build it first if needed:")
+        logger.error("  cd ../whatsapp-mcp/whatsapp-bridge")
+        logger.error("  go build -o whatsapp-client")
+        logger.error("")
+        logger.error("=" * 60)
+        return False
 
 
 def ensure_single_instance():
@@ -902,13 +1455,61 @@ def main():
         logger.error("Database check failed. Exiting.")
         return
 
-    # Initialize new features if available
-    daily_summary = None
+    # Ensure WhatsApp MCP server is running
+    if not ensure_mcp_server():
+        logger.warning("WhatsApp MCP server is not running. Some features may not work.")
+        logger.warning("Continuing anyway, but you may need to start it manually.")
+
+    logger.info("=" * 60)
+
+    # Initialize keyword monitoring (no MCP required)
     keyword_monitor = None
+    if KEYWORD_MONITORING_AVAILABLE:
+        try:
+            logger.info("Initializing keyword monitoring...")
+            keyword_monitor = create_keyword_monitor()
+            if keyword_monitor and keyword_monitor.enabled:
+                logger.info("✓ Keyword monitoring feature enabled")
+                logger.info(f"  Monitoring keywords: {', '.join(keyword_monitor.keywords)}")
+                logger.info(f"  Alert cooldown: {keyword_monitor.cooldown}s")
+            else:
+                logger.info("Keyword monitoring feature disabled")
+        except Exception as e:
+            logger.error(f"Error initializing keyword monitoring: {e}")
+    else:
+        logger.info("Keyword monitoring not available")
+
+    # Initialize AI Task Detection
+    ai_detector = None
+    if AI_TASK_DETECTION_AVAILABLE:
+        try:
+            logger.info("Initializing AI task detection...")
+            ai_detector = create_ai_task_detector()
+            if ai_detector and ai_detector.enabled:
+                logger.info("✓ AI Task Detection enabled")
+                logger.info(f"  Model: {ai_detector.claude_model}")
+                logger.info(f"  Confidence threshold: {ai_detector.confidence_threshold}%")
+                logger.info(f"  Daily budget: {ai_detector.daily_budget} API calls")
+                if ai_detector.batch_analysis:
+                    logger.info(f"  Batch analysis: enabled (size={ai_detector.batch_size})")
+                else:
+                    logger.info(f"  Batch analysis: disabled")
+                if ai_detector.learning_enabled:
+                    logger.info(f"  Learning: enabled")
+            else:
+                logger.info("AI Task Detection disabled")
+        except Exception as e:
+            logger.error(f"Error initializing AI task detection: {e}")
+            logger.info("Continuing without AI task detection...")
+    else:
+        logger.info("AI Task Detection not available")
+
+    # Initialize daily summary (requires MCP)
+    daily_summary = None
     mcp_client = None
 
-    if NEW_FEATURES_AVAILABLE and MCP_AVAILABLE:
-        logger.info("Initializing new features (daily summary & keyword monitoring)...")
+    if DAILY_SUMMARY_AVAILABLE and MCP_AVAILABLE:
+        logger.info("Initializing daily summary feature...")
 
         try:
             # Initialize MCP client
@@ -924,25 +1525,14 @@ def main():
                     logger.info("✓ Daily summary feature enabled")
                 else:
                     logger.info("Daily summary feature disabled")
-
-                # Create keyword monitor
-                keyword_monitor = create_keyword_monitor(mcp_client)
-                if keyword_monitor and keyword_monitor.enabled:
-                    logger.info("✓ Keyword monitoring feature enabled")
-                    logger.info(f"  Monitoring keywords: {', '.join(keyword_monitor.keywords)}")
-                else:
-                    logger.info("Keyword monitoring feature disabled")
             else:
-                logger.warning("MCP client not available, new features disabled")
+                logger.warning("MCP client not available, daily summary disabled")
 
         except Exception as e:
-            logger.error(f"Error initializing new features: {e}")
-            logger.info("Continuing with existing features only...")
+            logger.error(f"Error initializing daily summary: {e}")
+            logger.info("Continuing without daily summary...")
     else:
-        if not NEW_FEATURES_AVAILABLE:
-            logger.info("New features not installed (daily summary, keyword monitoring)")
-        if not MCP_AVAILABLE:
-            logger.info("MCP not available, new features disabled")
+        logger.info("Daily summary feature not available")
 
     logger.info("=" * 60)
     
@@ -950,6 +1540,7 @@ def main():
     # Use a slightly older timestamp to ensure we don't miss any messages
     last_check_time = datetime.now() - timedelta(minutes=5)
     keyword_check_time = last_check_time
+    last_purge_date = None  # Track when we last purged old suggestions
 
     try:
         while True:
@@ -958,20 +1549,117 @@ def main():
                 # This prevents race conditions where messages arrive during processing
                 cycle_start_time = datetime.now()
 
+                # Daily purge of old pending suggestions (once per day at startup or after midnight)
+                today = cycle_start_time.date()
+                if ai_detector and ai_detector.enabled and ai_detector.learning_engine:
+                    if last_purge_date != today:
+                        purged = ai_detector.learning_engine.purge_old_pending_suggestions(hours=24)
+                        if purged > 0:
+                            logger.info(f"Daily cleanup: purged {purged} expired task suggestions")
+                        last_purge_date = today
+
                 # First, check for any confirmation responses
                 check_for_confirmation_responses()
 
                 # Check for task responses
                 check_for_task_responses()
 
+                # Check for AI task responses
+                if ai_detector and ai_detector.enabled:
+                    try:
+                        check_ai_task_responses(ai_detector)
+                    except Exception as e:
+                        logger.error(f"Error checking AI task responses: {e}")
+
                 # Check for keywords (new feature)
                 if keyword_monitor and keyword_monitor.enabled:
                     try:
-                        loop = asyncio.get_event_loop()
-                        loop.run_until_complete(check_keywords_async(keyword_monitor, keyword_check_time))
+                        check_keywords(keyword_monitor, keyword_check_time)
                         keyword_check_time = cycle_start_time
                     except Exception as e:
                         logger.error(f"Error in keyword monitoring: {e}")
+
+                # AI Task Detection - analyze group messages
+                if ai_detector and ai_detector.enabled:
+                    try:
+                        # Get recent group messages for AI analysis
+                        recent_messages = get_recent_group_messages(last_check_time)
+
+                        # Filter out already processed messages
+                        messages_to_analyze = [
+                            msg for msg in recent_messages
+                            if msg.get('id', '') not in pending_ai_tasks
+                        ]
+
+                        if messages_to_analyze:
+                            # Use batch analysis if enabled and multiple messages
+                            if ai_detector.batch_analysis and len(messages_to_analyze) > 1:
+                                logger.info(f"Batch analyzing {len(messages_to_analyze)} messages (batch_size={ai_detector.batch_size})")
+
+                                # Process in batches
+                                for i in range(0, len(messages_to_analyze), ai_detector.batch_size):
+                                    batch = messages_to_analyze[i:i + ai_detector.batch_size]
+                                    results = ai_detector.analyze_messages_batch(batch)
+
+                                    # Process each result
+                                    for message, detection in zip(batch, results):
+                                        if detection and detection.get('is_action_item') and detection.get('confidence', 0) >= ai_detector.confidence_threshold:
+                                            # Get next task number from database
+                                            task_num = ai_detector.learning_engine.get_next_task_num() if ai_detector.learning_engine else 1
+
+                                            logger.info(f"AI detected task #{task_num}: confidence={detection['confidence']}%, subject={detection.get('subject', 'N/A')}")
+
+                                            # Format and send confirmation
+                                            confirmation_msg = format_ai_detection_confirmation(detection, task_num)
+                                            recipient = os.environ.get("KEYWORD_ALERT_RECIPIENT", "").strip("'\"")
+                                            send_whatsapp_response(recipient, confirmation_msg)
+
+                                            # Save to database
+                                            if ai_detector.learning_engine:
+                                                ai_detector.learning_engine.save_pending_suggestion(task_num, detection)
+
+                                            # Store in-memory cache
+                                            pending_ai_tasks[detection['message_id']] = {
+                                                'timestamp': datetime.now(),
+                                                'detection': detection,
+                                                'stage': 'initial',
+                                                'recipient': recipient,
+                                                'task_num': task_num
+                                            }
+                            else:
+                                # Individual analysis (single message or batch disabled)
+                                for message in messages_to_analyze:
+                                    detection = ai_detector.analyze_message(message)
+
+                                    if detection and detection.get('is_action_item') and detection.get('confidence', 0) >= ai_detector.confidence_threshold:
+                                        # Get next task number from database (persists across sessions)
+                                        task_num = ai_detector.learning_engine.get_next_task_num() if ai_detector.learning_engine else 1
+
+                                        # AI detected a potential task
+                                        logger.info(f"AI detected task #{task_num}: confidence={detection['confidence']}%, subject={detection.get('subject', 'N/A')}")
+
+                                        # Format confirmation message with task number
+                                        confirmation_msg = format_ai_detection_confirmation(detection, task_num)
+
+                                        # Send to configured recipient
+                                        recipient = os.environ.get("KEYWORD_ALERT_RECIPIENT", "").strip("'\"")
+                                        send_whatsapp_response(recipient, confirmation_msg)
+
+                                        # Save to database for persistence across sessions
+                                        if ai_detector.learning_engine:
+                                            ai_detector.learning_engine.save_pending_suggestion(task_num, detection)
+
+                                        # Store in-memory cache for quick lookups
+                                        pending_ai_tasks[detection['message_id']] = {
+                                            'timestamp': datetime.now(),
+                                            'detection': detection,
+                                            'stage': 'initial',
+                                            'recipient': recipient,
+                                            'task_num': task_num
+                                        }
+
+                    except Exception as e:
+                        logger.error(f"Error in AI task detection: {e}")
 
                 # Get recent messages with the #claude tag
                 claude_messages = get_recent_tagged_messages(last_check_time, CLAUDE_TAG)

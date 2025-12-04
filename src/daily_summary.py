@@ -59,18 +59,62 @@ class DailySummaryGenerator:
             logger.info(f"Recipient: {self.recipient}")
 
     def _parse_groups(self, groups_str: str) -> List[str]:
-        """Parse comma-separated quoted group JIDs"""
+        """Parse comma-separated quoted group JIDs or 'all' for all groups"""
         if not groups_str:
             return []
 
-        # Remove outer quotes and split by comma
-        groups_str = groups_str.strip("'\"")
+        # Remove outer quotes and strip
+        groups_str = groups_str.strip("'\"").strip().lower()
         if not groups_str:
             return []
+
+        # Check for 'all' keyword - will be resolved at runtime
+        if groups_str == 'all':
+            return ['all']
 
         # Split and clean each JID
         groups = [g.strip().strip("'\"") for g in groups_str.split(",")]
         return [g for g in groups if g and g.endswith("@g.us")]
+
+    async def fetch_all_groups(self) -> List[str]:
+        """
+        Fetch all available group JIDs
+
+        Returns:
+            List of group JIDs
+        """
+        try:
+            logger.info("Fetching all available groups...")
+
+            result = await self.whatsapp_client.call_tool(
+                "list_chats",
+                {
+                    "limit": 100,
+                    "include_last_message": False
+                }
+            )
+
+            if not result or not result.content:
+                logger.warning("No chats found")
+                return []
+
+            groups = []
+            for content in result.content:
+                if hasattr(content, 'text'):
+                    data = json.loads(content.text)
+                    chats = data.get("chats", [])
+                    for chat in chats:
+                        jid = chat.get("jid", "")
+                        if jid.endswith("@g.us"):
+                            groups.append(jid)
+                            logger.debug(f"Found group: {chat.get('name', jid)}")
+
+            logger.info(f"Found {len(groups)} groups")
+            return groups
+
+        except Exception as e:
+            logger.error(f"Error fetching all groups: {e}")
+            return []
 
     async def fetch_messages_last_24h(self, group_jid: str) -> List[Dict[str, Any]]:
         """
@@ -300,9 +344,19 @@ class DailySummaryGenerator:
                 logger.warning("No groups configured for daily summary")
                 return
 
+            # Resolve 'all' keyword to actual group JIDs
+            groups_to_process = self.groups
+            if self.groups == ['all']:
+                logger.info("Resolving 'all' to actual group list...")
+                groups_to_process = await self.fetch_all_groups()
+                if not groups_to_process:
+                    logger.warning("No groups found when resolving 'all'")
+                    return
+                logger.info(f"Found {len(groups_to_process)} groups to summarize")
+
             group_summaries = []
 
-            for group_jid in self.groups:
+            for group_jid in groups_to_process:
                 # Fetch messages
                 messages = await self.fetch_messages_last_24h(group_jid)
 
@@ -349,8 +403,11 @@ class DailySummaryGenerator:
             return
 
         if not self.groups:
-            logger.error("Cannot start scheduler: No groups configured")
+            logger.error("Cannot start scheduler: No groups configured (use 'all' for all groups)")
             return
+
+        if self.groups == ['all']:
+            logger.info("Daily summary configured for ALL groups")
 
         try:
             # Parse schedule time

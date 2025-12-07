@@ -1009,13 +1009,14 @@ def check_ai_task_responses(ai_detector):
         if not pending_ai_tasks:
             return
 
-        # Get the earliest timestamp from pending tasks
-        earliest_time = min(data['timestamp'] for data in pending_ai_tasks.values())
-        since_time = earliest_time.strftime("%Y-%m-%d %H:%M:%S")
+        # Only look at messages from the last 5 minutes to avoid processing old responses
+        # This prevents reprocessing after restarts
+        five_mins_ago = (datetime.now() - timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S")
+        since_time = five_mins_ago
 
-        # Use last_ai_response_time if set (to avoid reprocessing same responses)
-        if last_ai_response_time:
-            since_time = max(since_time, last_ai_response_time)
+        # Use last_ai_response_time if set and more recent
+        if last_ai_response_time and last_ai_response_time > since_time:
+            since_time = last_ai_response_time
 
         # Get any recipient to check (they should all be the same)
         recipient = list(pending_ai_tasks.values())[0]['recipient']

@@ -992,14 +992,28 @@ def check_ai_task_responses(ai_detector):
         cursor = conn.cursor()
 
         # Load pending suggestions from database (handles session restarts)
+        # Only load tasks from the last 24 hours to avoid duplicates
+        one_day_ago = datetime.now() - timedelta(days=1)
+
         if ai_detector.learning_engine:
             db_suggestions = ai_detector.learning_engine.get_pending_suggestions()
             for sugg in db_suggestions:
                 msg_id = sugg['message_id']
+
+                # Parse created_at and skip if older than 1 day
+                try:
+                    created_at = datetime.strptime(sugg['created_at'], "%Y-%m-%d %H:%M:%S") if sugg.get('created_at') else datetime.now()
+                    if created_at < one_day_ago:
+                        # Mark as expired in database
+                        ai_detector.learning_engine.update_suggestion_status(msg_id, 'expired')
+                        continue
+                except:
+                    created_at = datetime.now()
+
                 if msg_id not in pending_ai_tasks:
                     # Reload from database
                     pending_ai_tasks[msg_id] = {
-                        'timestamp': datetime.strptime(sugg['created_at'], "%Y-%m-%d %H:%M:%S") if sugg.get('created_at') else datetime.now(),
+                        'timestamp': created_at,
                         'detection': sugg['detection'],
                         'stage': 'initial',
                         'recipient': os.environ.get("KEYWORD_ALERT_RECIPIENT", "").strip("'\""),

@@ -1075,23 +1075,15 @@ def check_ai_task_responses(ai_detector):
             num_match = re.match(r'^(?:yes\s+|create\s+|ok\s+)?(\d+)$', response)
             if num_match:
                 task_num = int(num_match.group(1))
-                # Find the task with this number
-                found = False
-                for msg_id, data in pending_ai_tasks.items():
-                    if data.get('task_num') == task_num and data.get('stage') == 'initial':
-                        if (msg_id, data) not in to_approve:
-                            to_approve.append((msg_id, data))
-                            logger.info(f"User approved task #{task_num}")
-                        found = True
-                        break
-
-                if not found:
-                    # Task not found - send error to WhatsApp
-                    logger.warning(f"Task #{task_num} not found in pending tasks. Available: {pending_task_nums}")
-                    send_whatsapp_response(
-                        recipient,
-                        f"❌ Task #{task_num} not found.\n\nPending tasks: {pending_task_nums[:10]}\n\nReply with a valid task number."
-                    )
+                # Only process if it's a reasonable task number (1-999)
+                if task_num <= 999:
+                    # Find the task with this number
+                    for msg_id, data in pending_ai_tasks.items():
+                        if data.get('task_num') == task_num and data.get('stage') == 'initial':
+                            if (msg_id, data) not in to_approve:
+                                to_approve.append((msg_id, data))
+                                logger.info(f"User approved task #{task_num}")
+                            break
 
             # Check for rejection of specific task (e.g., "no 3" or "skip 3")
             reject_match = re.match(r'^(?:no|skip|reject)\s+(\d+)$', response)

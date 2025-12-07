@@ -183,6 +183,14 @@ start_monitor() {
 
     log "Starting Python Monitor..."
 
+    # Load environment variables from config
+    if [ -f "$WORK_DIR/config/settings.env" ]; then
+        log "Loading configuration from config/settings.env"
+        export $(grep -v '^#' "$WORK_DIR/config/settings.env" | xargs)
+    else
+        log "WARNING: config/settings.env not found, some features may not work"
+    fi
+
     # Activate virtual environment if exists
     if [ -d "venv" ]; then
         source venv/bin/activate

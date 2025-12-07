@@ -987,6 +987,8 @@ def check_ai_task_responses(ai_detector):
     """Check for responses to AI-detected task suggestions"""
     global pending_ai_tasks, last_ai_response_time
 
+    recipient = os.environ.get("KEYWORD_ALERT_RECIPIENT", "").strip("'\"")
+
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
@@ -994,6 +996,7 @@ def check_ai_task_responses(ai_detector):
         # Load pending suggestions from database (handles session restarts)
         if ai_detector.learning_engine:
             db_suggestions = ai_detector.learning_engine.get_pending_suggestions()
+            loaded_count = 0
             for sugg in db_suggestions:
                 msg_id = sugg['message_id']
                 if msg_id not in pending_ai_tasks:
@@ -1002,12 +1005,18 @@ def check_ai_task_responses(ai_detector):
                         'timestamp': datetime.strptime(sugg['created_at'], "%Y-%m-%d %H:%M:%S") if sugg.get('created_at') else datetime.now(),
                         'detection': sugg['detection'],
                         'stage': 'initial',
-                        'recipient': os.environ.get("KEYWORD_ALERT_RECIPIENT", "").strip("'\""),
+                        'recipient': recipient,
                         'task_num': sugg['task_num']
                     }
+                    loaded_count += 1
+            if loaded_count > 0:
+                logger.info(f"Loaded {loaded_count} pending tasks from database (total: {len(pending_ai_tasks)})")
 
         if not pending_ai_tasks:
             return
+
+        # Get list of pending task numbers for reference
+        pending_task_nums = sorted([data['task_num'] for data in pending_ai_tasks.values()])
 
         # Get the earliest timestamp from pending tasks
         earliest_time = min(data['timestamp'] for data in pending_ai_tasks.values())
@@ -1016,9 +1025,6 @@ def check_ai_task_responses(ai_detector):
         # Use last_ai_response_time if set (to avoid reprocessing same responses)
         if last_ai_response_time:
             since_time = max(since_time, last_ai_response_time)
-
-        # Get any recipient to check (they should all be the same)
-        recipient = list(pending_ai_tasks.values())[0]['recipient']
 
         # Query for recent messages from the recipient (user's responses)
         # Only get responses NEWER than since_time to avoid duplicates
@@ -1070,12 +1076,22 @@ def check_ai_task_responses(ai_detector):
             if num_match:
                 task_num = int(num_match.group(1))
                 # Find the task with this number
+                found = False
                 for msg_id, data in pending_ai_tasks.items():
                     if data.get('task_num') == task_num and data.get('stage') == 'initial':
                         if (msg_id, data) not in to_approve:
                             to_approve.append((msg_id, data))
                             logger.info(f"User approved task #{task_num}")
+                        found = True
                         break
+
+                if not found:
+                    # Task not found - send error to WhatsApp
+                    logger.warning(f"Task #{task_num} not found in pending tasks. Available: {pending_task_nums}")
+                    send_whatsapp_response(
+                        recipient,
+                        f"❌ Task #{task_num} not found.\n\nPending tasks: {pending_task_nums[:10]}\n\nReply with a valid task number."
+                    )
 
             # Check for rejection of specific task (e.g., "no 3" or "skip 3")
             reject_match = re.match(r'^(?:no|skip|reject)\s+(\d+)$', response)
@@ -1119,7 +1135,15 @@ def check_ai_task_responses(ai_detector):
                 del pending_ai_tasks[msg_id]
 
     except Exception as e:
-        logger.error(f"Error checking AI task responses: {e}")
+        logger.error(f"Error checking AI task responses: {e}", exc_info=True)
+        # Send error to WhatsApp
+        try:
+            send_whatsapp_response(
+                recipient,
+                f"❌ Error processing task approval: {str(e)[:200]}"
+            )
+        except:
+            pass
     finally:
         if 'conn' in locals():
             conn.close()
@@ -1267,7 +1291,15 @@ View task: {task_url}
             return None
 
     except Exception as e:
-        logger.error(f"Error processing AI task approval: {e}")
+        logger.error(f"Error processing AI task approval: {e}", exc_info=True)
+        # Send error to WhatsApp
+        try:
+            send_whatsapp_response(
+                data.get('recipient', os.environ.get("KEYWORD_ALERT_RECIPIENT", "").strip("'\"")),
+                f"❌ Error creating task: {str(e)[:200]}"
+            )
+        except:
+            pass
         return None
 
 

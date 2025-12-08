@@ -492,7 +492,8 @@ class LearningEngine:
 
     def get_next_task_num(self) -> int:
         """
-        Get next task number for today (persists across sessions)
+        Get next task number for this month (persists across sessions)
+        Task numbers reset at the start of each month.
 
         Returns:
             Next task number
@@ -500,15 +501,16 @@ class LearningEngine:
         try:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
-            today = datetime.now().strftime("%Y-%m-%d")
+            # Use monthly key format (YYYY-MM) instead of daily
+            this_month = datetime.now().strftime("%Y-%m")
 
-            # Get or create counter for today
+            # Get or create counter for this month
             cursor.execute("""
                 INSERT INTO task_counter (date, last_num)
                 VALUES (?, 0)
                 ON CONFLICT(date) DO UPDATE SET last_num = last_num + 1
                 RETURNING last_num
-            """, (today,))
+            """, (this_month,))
 
             result = cursor.fetchone()
             if result:
@@ -517,8 +519,8 @@ class LearningEngine:
                 # Fallback for older SQLite without RETURNING
                 cursor.execute("""
                     UPDATE task_counter SET last_num = last_num + 1 WHERE date = ?
-                """, (today,))
-                cursor.execute("SELECT last_num FROM task_counter WHERE date = ?", (today,))
+                """, (this_month,))
+                cursor.execute("SELECT last_num FROM task_counter WHERE date = ?", (this_month,))
                 result = cursor.fetchone()
                 task_num = result[0] if result else 1
 

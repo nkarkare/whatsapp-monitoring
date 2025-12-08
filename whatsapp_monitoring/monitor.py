@@ -128,6 +128,12 @@ pending_ai_tasks = {}
 # Track last processed response timestamp to avoid duplicate processing
 last_ai_response_time = None
 
+# Track last processed reaction ID to avoid duplicates
+last_reaction_check_time = None
+
+# Track processed reactions (in-memory set, persists via database)
+processed_reactions = set()
+
 # Claude API Configuration - Set these in environment variables for security
 CLAUDE_API_KEY = get_env_or_default("CLAUDE_API_KEY", "")
 CLAUDE_API_URL = get_env_or_default("CLAUDE_API_URL", "https://api.anthropic.com/v1/messages")
@@ -1140,6 +1146,135 @@ def check_ai_task_responses(ai_detector):
             conn.close()
 
 
+def check_reaction_tasks(ai_detector):
+    """
+    Check for 👍 reactions to create tasks directly.
+    Only processes reactions from the authorized user (KEYWORD_ALERT_RECIPIENT).
+    """
+    global last_reaction_check_time, processed_reactions
+
+    try:
+        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        cursor = conn.cursor()
+
+        # Get authorized user phone number
+        authorized_user = os.environ.get("KEYWORD_ALERT_RECIPIENT", "").strip("'\"")
+        if not authorized_user:
+            return
+
+        # Only check reactions from the last 5 minutes
+        five_mins_ago = (datetime.now() - timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S")
+        since_time = five_mins_ago
+
+        if last_reaction_check_time and last_reaction_check_time > since_time:
+            since_time = last_reaction_check_time
+
+        # Query for recent thumbs up reactions from authorized user
+        query = """
+        SELECT r.id, r.chat_jid, r.sender, r.emoji, r.timestamp, r.reacted_message_id
+        FROM reactions r
+        WHERE r.emoji = '👍'
+            AND r.sender LIKE ?
+            AND datetime(substr(r.timestamp, 1, 19)) > datetime(?)
+        ORDER BY r.timestamp ASC
+        LIMIT 20
+        """
+
+        cursor.execute(query, (f"%{authorized_user.replace('91', '')}%", since_time))
+        reactions = cursor.fetchall()
+
+        if not reactions:
+            return
+
+        for reaction_id, chat_jid, sender, emoji, timestamp, reacted_msg_id in reactions:
+            # Skip already processed reactions
+            if reaction_id in processed_reactions:
+                continue
+
+            # Update last check time
+            last_reaction_check_time = timestamp
+
+            # Get the original message content
+            msg_query = """
+            SELECT m.content, m.sender, m.timestamp
+            FROM messages m
+            WHERE m.id = ?
+            LIMIT 1
+            """
+            cursor.execute(msg_query, (reacted_msg_id,))
+            msg_result = cursor.fetchone()
+
+            if not msg_result:
+                logger.warning(f"Could not find message {reacted_msg_id} for reaction")
+                processed_reactions.add(reaction_id)
+                continue
+
+            message_content, msg_sender, msg_timestamp = msg_result
+
+            if not message_content or not message_content.strip():
+                logger.debug(f"Empty message content for {reacted_msg_id}")
+                processed_reactions.add(reaction_id)
+                continue
+
+            # Mark as processed
+            processed_reactions.add(reaction_id)
+
+            # Get next task number (monthly reset)
+            task_num = 1
+            if ai_detector and ai_detector.learning_engine:
+                task_num = ai_detector.learning_engine.get_next_task_num()
+
+            # Create the task
+            logger.info(f"Creating task #{task_num} from 👍 reaction to: {message_content[:50]}...")
+
+            # Build task details
+            task_details = {
+                'subject': message_content[:200].strip(),
+                'description': f"""Task created via 👍 reaction
+
+Original message: "{message_content}"
+
+From: {msg_sender}
+Chat: {chat_jid}
+Time: {msg_timestamp}
+
+Created by: {sender} (reaction at {timestamp})
+""",
+                'priority': 'Medium',
+                'has_details': True
+            }
+
+            # Create the task
+            result = create_erpnext_task(task_details)
+
+            if result.get('success'):
+                task_id = result.get('task_id', 'Unknown')
+                task_url = result.get('task_url', '')
+
+                success_msg = f"""✅ Task #{task_num} created from 👍 reaction!
+
+📋 Task ID: {task_id}
+📝 Subject: {message_content[:100]}...
+🔗 {task_url}"""
+
+                send_whatsapp_response(authorized_user, success_msg)
+                logger.info(f"Created task {task_id} from reaction")
+
+            else:
+                error = result.get('error', 'Unknown error')
+                send_whatsapp_response(
+                    authorized_user,
+                    f"❌ Failed to create task from 👍: {error}"
+                )
+                logger.error(f"Failed to create task from reaction: {error}")
+
+    except Exception as e:
+        logger.error(f"Error checking reaction tasks: {e}")
+    finally:
+        if 'conn' in locals():
+            conn.close()
+
+
 def process_ai_task_approval(data: Dict, ai_detector):
     """
     Process approved AI task creation
@@ -1585,6 +1720,12 @@ def main():
                         check_ai_task_responses(ai_detector)
                     except Exception as e:
                         logger.error(f"Error checking AI task responses: {e}")
+
+                # Check for 👍 reaction-based task creation
+                try:
+                    check_reaction_tasks(ai_detector)
+                except Exception as e:
+                    logger.error(f"Error checking reaction tasks: {e}")
 
                 # Check for keywords (new feature)
                 if keyword_monitor and keyword_monitor.enabled:

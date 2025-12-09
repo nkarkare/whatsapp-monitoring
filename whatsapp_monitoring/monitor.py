@@ -1218,6 +1218,22 @@ def check_reaction_tasks(ai_detector):
                 processed_reactions.add(reaction_id)
                 continue
 
+            # Check if this is a task prompt message (bot's confirmation message)
+            # If so, extract the original content from it
+            if "🤖 *Task #" in message_content and "📝 *Original:*" in message_content:
+                # Extract original message from the prompt
+                import re
+                original_match = re.search(r'📝 \*Original:\* ["\']?(.+?)["\']?\n', message_content, re.DOTALL)
+                if original_match:
+                    message_content = original_match.group(1).strip().rstrip('"\'')
+                    logger.info(f"Extracted original content from task prompt: {message_content[:50]}...")
+                else:
+                    # Try to extract subject
+                    subject_match = re.search(r'📋 \*Subject:\* (.+?)\n', message_content)
+                    if subject_match:
+                        message_content = subject_match.group(1).strip()
+                        logger.info(f"Using subject from task prompt: {message_content[:50]}...")
+
             # Mark as processed
             processed_reactions.add(reaction_id)
 

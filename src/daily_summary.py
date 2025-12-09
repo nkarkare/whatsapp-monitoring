@@ -4,15 +4,18 @@ Daily Summary Module
 
 Generates and sends daily summaries of WhatsApp group activity.
 Scheduled using APScheduler with timezone support.
+Uses direct SQLite access for reliability (no async MCP issues).
 """
 
 import os
 import logging
-import asyncio
+import sqlite3
+import requests
 import json
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
 from collections import Counter
+from pathlib import Path
 
 try:
     from apscheduler.schedulers.background import BackgroundScheduler
@@ -25,6 +28,10 @@ except ImportError:
 
 logger = logging.getLogger("whatsapp_monitoring.daily_summary")
 
+# Default database path
+BASE_DIR = Path(__file__).resolve().parent.parent
+DEFAULT_DB_PATH = os.path.join(os.path.dirname(BASE_DIR), 'whatsapp-mcp', 'whatsapp-bridge', 'store', 'messages.db')
+
 
 class DailySummaryGenerator:
     """Generates daily summaries of WhatsApp group activity"""
@@ -34,7 +41,7 @@ class DailySummaryGenerator:
         Initialize daily summary generator
 
         Args:
-            whatsapp_client: WhatsApp MCP client session
+            whatsapp_client: WhatsApp MCP client session (not used, kept for compatibility)
             config: Configuration dictionary with:
                 - enabled: bool
                 - recipient: str (phone number)
@@ -42,9 +49,15 @@ class DailySummaryGenerator:
                 - schedule_time: str (HH:MM format)
                 - timezone: str
         """
-        self.whatsapp_client = whatsapp_client
+        self.whatsapp_client = whatsapp_client  # Kept for compatibility
         self.config = config
         self.scheduler = None
+
+        # Database path
+        self.db_path = os.environ.get("MESSAGES_DB_PATH", DEFAULT_DB_PATH)
+
+        # WhatsApp API URL
+        self.whatsapp_api_url = os.environ.get("WHATSAPP_API_URL", "http://localhost:8080/api/send")
 
         # Validate configuration
         self.enabled = config.get("enabled", False)
@@ -76,39 +89,32 @@ class DailySummaryGenerator:
         groups = [g.strip().strip("'\"") for g in groups_str.split(",")]
         return [g for g in groups if g and g.endswith("@g.us")]
 
-    async def fetch_all_groups(self) -> List[str]:
+    def fetch_all_groups(self) -> List[Dict[str, str]]:
         """
-        Fetch all available group JIDs
+        Fetch all available groups from database
 
         Returns:
-            List of group JIDs
+            List of dicts with 'jid' and 'name'
         """
         try:
-            logger.info("Fetching all available groups...")
+            logger.info("Fetching all available groups from database...")
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
 
-            result = await self.whatsapp_client.call_tool(
-                "list_chats",
-                {
-                    "limit": 100,
-                    "include_last_message": False
-                }
-            )
-
-            if not result or not result.content:
-                logger.warning("No chats found")
-                return []
+            cursor.execute("""
+                SELECT jid, name FROM chats
+                WHERE jid LIKE '%@g.us'
+                ORDER BY last_message_time DESC
+            """)
 
             groups = []
-            for content in result.content:
-                if hasattr(content, 'text'):
-                    data = json.loads(content.text)
-                    chats = data.get("chats", [])
-                    for chat in chats:
-                        jid = chat.get("jid", "")
-                        if jid.endswith("@g.us"):
-                            groups.append(jid)
-                            logger.debug(f"Found group: {chat.get('name', jid)}")
+            for row in cursor.fetchall():
+                groups.append({
+                    'jid': row[0],
+                    'name': row[1] or row[0]
+                })
 
+            conn.close()
             logger.info(f"Found {len(groups)} groups")
             return groups
 
@@ -116,7 +122,7 @@ class DailySummaryGenerator:
             logger.error(f"Error fetching all groups: {e}")
             return []
 
-    async def fetch_messages_last_24h(self, group_jid: str) -> List[Dict[str, Any]]:
+    def fetch_messages_last_24h(self, group_jid: str) -> List[Dict[str, Any]]:
         """
         Fetch messages from last 24 hours for a specific group
 
@@ -129,40 +135,40 @@ class DailySummaryGenerator:
         try:
             # Calculate timestamp for 24 hours ago
             yesterday = datetime.now() - timedelta(days=1)
-            after_timestamp = yesterday.isoformat()
+            after_timestamp = yesterday.strftime("%Y-%m-%d %H:%M:%S")
 
             logger.debug(f"Fetching messages for {group_jid} after {after_timestamp}")
 
-            # Call WhatsApp MCP to get messages
-            result = await self.whatsapp_client.call_tool(
-                "list_messages",
-                {
-                    "chat_jid": group_jid,
-                    "after": after_timestamp,
-                    "limit": 1000,
-                    "include_context": False
-                }
-            )
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
 
-            if not result or not result.content:
-                logger.warning(f"No response for group {group_jid}")
-                return []
+            cursor.execute("""
+                SELECT id, sender, content, timestamp, is_from_me
+                FROM messages
+                WHERE chat_jid = ?
+                AND datetime(substr(timestamp, 1, 19)) > datetime(?)
+                ORDER BY timestamp ASC
+            """, (group_jid, after_timestamp))
 
-            # Parse response
-            for content in result.content:
-                if hasattr(content, 'text'):
-                    data = json.loads(content.text)
-                    messages = data.get("messages", [])
-                    logger.debug(f"Found {len(messages)} messages for {group_jid}")
-                    return messages
+            messages = []
+            for row in cursor.fetchall():
+                messages.append({
+                    'id': row[0],
+                    'sender': row[1],
+                    'content': row[2],
+                    'timestamp': row[3],
+                    'is_from_me': row[4]
+                })
 
-            return []
+            conn.close()
+            logger.debug(f"Found {len(messages)} messages for {group_jid}")
+            return messages
 
         except Exception as e:
             logger.error(f"Error fetching messages for {group_jid}: {e}")
             return []
 
-    async def get_group_name(self, group_jid: str) -> str:
+    def get_group_name(self, group_jid: str) -> str:
         """
         Get group name from JID
 
@@ -173,18 +179,14 @@ class DailySummaryGenerator:
             Group name or JID if not found
         """
         try:
-            result = await self.whatsapp_client.call_tool(
-                "get_chat",
-                {"chat_jid": group_jid}
-            )
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
 
-            if result and result.content:
-                for content in result.content:
-                    if hasattr(content, 'text'):
-                        data = json.loads(content.text)
-                        return data.get("name", group_jid)
+            cursor.execute("SELECT name FROM chats WHERE jid = ?", (group_jid,))
+            result = cursor.fetchone()
+            conn.close()
 
-            return group_jid
+            return result[0] if result and result[0] else group_jid
 
         except Exception as e:
             logger.error(f"Error getting group name for {group_jid}: {e}")
@@ -198,145 +200,132 @@ class DailySummaryGenerator:
             messages: List of message dictionaries
 
         Returns:
-            Dictionary with analysis results
+            Statistics dictionary
         """
         if not messages:
             return {
-                "total_count": 0,
+                "total_messages": 0,
+                "unique_senders": 0,
                 "top_senders": [],
-                "time_distribution": {},
-                "sample_messages": []
+                "hourly_distribution": {},
+                "keywords": []
             }
 
         # Count messages per sender
-        senders = [msg.get("sender_name", "Unknown") for msg in messages if msg.get("sender_name")]
-        sender_counts = Counter(senders)
-        top_senders = sender_counts.most_common(5)
-
-        # Time distribution (morning, afternoon, evening, night)
-        time_distribution = {"morning": 0, "afternoon": 0, "evening": 0, "night": 0}
+        sender_counts = Counter()
+        hourly_counts = Counter()
 
         for msg in messages:
-            timestamp_str = msg.get("timestamp")
-            if timestamp_str:
+            sender = msg.get("sender", "Unknown")
+            sender_counts[sender] += 1
+
+            # Extract hour from timestamp
+            timestamp = msg.get("timestamp", "")
+            if timestamp:
                 try:
-                    # Parse timestamp
-                    if isinstance(timestamp_str, int):
-                        msg_time = datetime.fromtimestamp(timestamp_str)
-                    else:
-                        msg_time = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+                    # Handle various timestamp formats
+                    ts = timestamp[:19]  # Get YYYY-MM-DD HH:MM:SS part
+                    dt = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+                    hourly_counts[dt.hour] += 1
+                except:
+                    pass
 
-                    hour = msg_time.hour
-
-                    if 5 <= hour < 12:
-                        time_distribution["morning"] += 1
-                    elif 12 <= hour < 17:
-                        time_distribution["afternoon"] += 1
-                    elif 17 <= hour < 21:
-                        time_distribution["evening"] += 1
-                    else:
-                        time_distribution["night"] += 1
-
-                except Exception as e:
-                    logger.debug(f"Error parsing timestamp {timestamp_str}: {e}")
-
-        # Get sample of recent messages (last 3)
-        sample_messages = messages[-3:] if len(messages) >= 3 else messages
+        # Get top senders
+        top_senders = sender_counts.most_common(5)
 
         return {
-            "total_count": len(messages),
-            "top_senders": top_senders,
-            "time_distribution": time_distribution,
-            "sample_messages": sample_messages
+            "total_messages": len(messages),
+            "unique_senders": len(sender_counts),
+            "top_senders": [{"sender": s, "count": c} for s, c in top_senders],
+            "hourly_distribution": dict(hourly_counts),
+            "keywords": []  # Could be enhanced with keyword extraction
         }
 
     def format_summary(self, group_summaries: List[Dict[str, Any]]) -> str:
         """
-        Format the summary message
+        Format summary for WhatsApp message
 
         Args:
             group_summaries: List of group summary dictionaries
 
         Returns:
-            Formatted summary message
+            Formatted summary string
         """
-        lines = []
-        lines.append("📊 *Daily WhatsApp Summary*")
-        lines.append(f"📅 {datetime.now().strftime('%B %d, %Y')}")
-        lines.append("")
-        lines.append("=" * 40)
-        lines.append("")
+        now = datetime.now()
+        date_str = now.strftime("%A, %B %d, %Y")
 
-        total_messages = sum(gs["stats"]["total_count"] for gs in group_summaries)
-        lines.append(f"📬 *Total Messages:* {total_messages}")
-        lines.append(f"👥 *Groups Monitored:* {len(group_summaries)}")
-        lines.append("")
+        summary_parts = [
+            f"📊 *Daily WhatsApp Summary*",
+            f"📅 {date_str}",
+            "",
+        ]
 
-        for group_summary in group_summaries:
-            group_name = group_summary["name"]
-            stats = group_summary["stats"]
+        total_messages = 0
+        for group_data in group_summaries:
+            stats = group_data.get("stats", {})
+            msg_count = stats.get("total_messages", 0)
+            total_messages += msg_count
 
-            lines.append(f"📱 *{group_name}*")
-            lines.append(f"   💬 Messages: {stats['total_count']}")
+            if msg_count == 0:
+                continue
 
-            if stats["top_senders"]:
-                lines.append(f"   👤 Top Senders:")
-                for sender, count in stats["top_senders"][:3]:
-                    lines.append(f"      • {sender}: {count} msgs")
+            group_name = group_data.get("name", "Unknown Group")
+            unique_senders = stats.get("unique_senders", 0)
+            top_senders = stats.get("top_senders", [])
 
-            # Time distribution
-            time_dist = stats["time_distribution"]
-            if sum(time_dist.values()) > 0:
-                lines.append(f"   ⏰ Activity:")
-                if time_dist["morning"] > 0:
-                    lines.append(f"      • Morning: {time_dist['morning']}")
-                if time_dist["afternoon"] > 0:
-                    lines.append(f"      • Afternoon: {time_dist['afternoon']}")
-                if time_dist["evening"] > 0:
-                    lines.append(f"      • Evening: {time_dist['evening']}")
-                if time_dist["night"] > 0:
-                    lines.append(f"      • Night: {time_dist['night']}")
+            summary_parts.append(f"*{group_name}*")
+            summary_parts.append(f"💬 {msg_count} messages from {unique_senders} participants")
 
-            lines.append("")
+            if top_senders:
+                top_list = ", ".join([f"{s['sender'].split('@')[0][:10]}({s['count']})" for s in top_senders[:3]])
+                summary_parts.append(f"👥 Top: {top_list}")
 
-        lines.append("=" * 40)
-        lines.append("")
-        lines.append("✨ _Generated by WhatsApp Monitoring_")
+            summary_parts.append("")
 
-        return "\n".join(lines)
+        if total_messages == 0:
+            summary_parts.append("No activity in the last 24 hours.")
+        else:
+            summary_parts.append(f"📈 *Total: {total_messages} messages across {len([g for g in group_summaries if g['stats']['total_messages'] > 0])} active groups*")
 
-    async def send_summary(self, summary_text: str):
+        return "\n".join(summary_parts)
+
+    def send_summary(self, summary_text: str) -> bool:
         """
         Send summary via WhatsApp
 
         Args:
-            summary_text: Formatted summary message
+            summary_text: Summary text to send
+
+        Returns:
+            True if sent successfully
         """
         try:
             if not self.recipient:
                 logger.error("No recipient configured for daily summary")
-                return
+                return False
 
             logger.info(f"Sending daily summary to {self.recipient}")
 
-            result = await self.whatsapp_client.call_tool(
-                "send_message",
-                {
-                    "recipient": self.recipient,
-                    "message": summary_text
-                }
-            )
+            payload = {
+                "recipient": self.recipient,
+                "message": summary_text
+            }
 
-            if result:
+            response = requests.post(self.whatsapp_api_url, json=payload, timeout=10)
+
+            if response.status_code == 200:
                 logger.info("Daily summary sent successfully")
+                return True
             else:
-                logger.error("Failed to send daily summary")
+                logger.error(f"Failed to send daily summary: HTTP {response.status_code}")
+                return False
 
         except Exception as e:
             logger.error(f"Error sending daily summary: {e}")
+            return False
 
-    async def generate_and_send_summary(self):
-        """Generate and send the daily summary"""
+    def generate_and_send_summary(self):
+        """Generate and send the daily summary (synchronous version)"""
         try:
             logger.info("Generating daily summary...")
 
@@ -345,30 +334,30 @@ class DailySummaryGenerator:
                 return
 
             # Resolve 'all' keyword to actual group JIDs
-            groups_to_process = self.groups
             if self.groups == ['all']:
                 logger.info("Resolving 'all' to actual group list...")
-                groups_to_process = await self.fetch_all_groups()
-                if not groups_to_process:
+                groups_data = self.fetch_all_groups()
+                if not groups_data:
                     logger.warning("No groups found when resolving 'all'")
                     return
-                logger.info(f"Found {len(groups_to_process)} groups to summarize")
+                logger.info(f"Found {len(groups_data)} groups to summarize")
+            else:
+                groups_data = [{'jid': g, 'name': self.get_group_name(g)} for g in self.groups]
 
             group_summaries = []
 
-            for group_jid in groups_to_process:
-                # Fetch messages
-                messages = await self.fetch_messages_last_24h(group_jid)
+            for group_info in groups_data:
+                group_jid = group_info['jid']
 
-                # Get group name
-                group_name = await self.get_group_name(group_jid)
+                # Fetch messages
+                messages = self.fetch_messages_last_24h(group_jid)
 
                 # Analyze messages
                 stats = self.analyze_messages(messages)
 
                 group_summaries.append({
                     "jid": group_jid,
-                    "name": group_name,
+                    "name": group_info['name'],
                     "stats": stats
                 })
 
@@ -376,17 +365,19 @@ class DailySummaryGenerator:
             summary_text = self.format_summary(group_summaries)
 
             # Send summary
-            await self.send_summary(summary_text)
+            self.send_summary(summary_text)
 
             logger.info("Daily summary completed")
 
         except Exception as e:
             logger.error(f"Error generating daily summary: {e}")
+            import traceback
+            traceback.print_exc()
 
     def _job_wrapper(self):
-        """Wrapper to run async job in scheduler"""
+        """Wrapper to run job in scheduler"""
         logger.info("Daily summary job triggered")
-        asyncio.run(self.generate_and_send_summary())
+        self.generate_and_send_summary()
 
     def start_scheduler(self):
         """Start the daily summary scheduler"""
@@ -411,7 +402,9 @@ class DailySummaryGenerator:
 
         try:
             # Parse schedule time
-            hour, minute = map(int, self.schedule_time.split(":"))
+            hour, minute = self.schedule_time.split(":")
+            hour = int(hour)
+            minute = int(minute)
 
             # Get timezone
             tz = pytz.timezone(self.timezone_str)
@@ -424,7 +417,7 @@ class DailySummaryGenerator:
             self.scheduler.add_job(
                 self._job_wrapper,
                 trigger=trigger,
-                id="daily_summary_job",
+                id="daily_whatsapp_summary",
                 name="Daily WhatsApp Summary",
                 replace_existing=True
             )
@@ -432,36 +425,55 @@ class DailySummaryGenerator:
             # Start scheduler
             self.scheduler.start()
 
-            logger.info(f"✓ Daily summary scheduler started")
+            # Get next run time
+            job = self.scheduler.get_job("daily_whatsapp_summary")
+            next_run = job.next_run_time if job else "Unknown"
+
+            logger.info("✓ Daily summary scheduler started")
             logger.info(f"  Schedule: {self.schedule_time} {self.timezone_str}")
-            logger.info(f"  Next run: {self.scheduler.get_job('daily_summary_job').next_run_time}")
+            logger.info(f"  Next run: {next_run}")
 
         except Exception as e:
-            logger.error(f"Error starting scheduler: {e}")
+            logger.error(f"Failed to start daily summary scheduler: {e}")
 
     def stop_scheduler(self):
         """Stop the daily summary scheduler"""
         if self.scheduler:
-            self.scheduler.shutdown()
-            logger.info("Daily summary scheduler stopped")
+            logger.info("Stopping daily summary scheduler...")
+            self.scheduler.shutdown(wait=False)
+            self.scheduler = None
+            logger.info("✓ Daily summary scheduler stopped")
+
+    def run_now(self):
+        """Manually trigger the daily summary"""
+        logger.info("Manually triggering daily summary...")
+        self.generate_and_send_summary()
 
 
-def create_from_env(whatsapp_client) -> Optional[DailySummaryGenerator]:
+def create_from_env(whatsapp_client=None) -> Optional[DailySummaryGenerator]:
     """
     Create DailySummaryGenerator from environment variables
 
-    Args:
-        whatsapp_client: WhatsApp MCP client session
+    Environment variables:
+        DAILY_SUMMARY_ENABLED: "true" to enable
+        DAILY_SUMMARY_RECIPIENT: Phone number to send summary to
+        DAILY_SUMMARY_GROUPS: Comma-separated group JIDs or 'all'
+        DAILY_SUMMARY_TIME: Time in HH:MM format (default: 09:00)
+        DAILY_SUMMARY_TIMEZONE: Timezone (default: Asia/Kolkata)
 
     Returns:
         DailySummaryGenerator instance or None if disabled
     """
     config = {
-        "enabled": os.environ.get("DAILY_SUMMARY_ENABLED", "false").lower() == "true",
+        "enabled": os.environ.get("DAILY_SUMMARY_ENABLED", "").lower() == "true",
         "recipient": os.environ.get("DAILY_SUMMARY_RECIPIENT", ""),
         "groups": os.environ.get("DAILY_SUMMARY_GROUPS", ""),
-        "schedule_time": os.environ.get("DAILY_SUMMARY_TIME", "09:00"),
+        "schedule_time": os.environ.get("DAILY_SUMMARY_TIME", "19:00"),
         "timezone": os.environ.get("DAILY_SUMMARY_TIMEZONE", "Asia/Kolkata")
     }
+
+    if not config["enabled"]:
+        logger.info("Daily summary feature disabled")
+        return None
 
     return DailySummaryGenerator(whatsapp_client, config)

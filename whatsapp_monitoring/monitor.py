@@ -1169,18 +1169,20 @@ def check_reaction_tasks(ai_detector):
         if last_reaction_check_time and last_reaction_check_time > since_time:
             since_time = last_reaction_check_time
 
-        # Query for recent thumbs up reactions from authorized user
+        # Query for recent thumbs up reactions from ME (is_from_me = 1)
+        # Only in direct chats (not groups which end with @g.us)
         query = """
         SELECT r.id, r.chat_jid, r.sender, r.emoji, r.timestamp, r.reacted_message_id
         FROM reactions r
         WHERE r.emoji = '👍'
-            AND r.sender LIKE ?
+            AND r.is_from_me = 1
+            AND r.chat_jid NOT LIKE '%@g.us'
             AND datetime(substr(r.timestamp, 1, 19)) > datetime(?)
         ORDER BY r.timestamp ASC
         LIMIT 20
         """
 
-        cursor.execute(query, (f"%{authorized_user.replace('91', '')}%", since_time))
+        cursor.execute(query, (since_time,))
         reactions = cursor.fetchall()
 
         if not reactions:
@@ -1224,49 +1226,38 @@ def check_reaction_tasks(ai_detector):
             if ai_detector and ai_detector.learning_engine:
                 task_num = ai_detector.learning_engine.get_next_task_num()
 
-            # Create the task
             logger.info(f"Creating task #{task_num} from 👍 reaction to: {message_content[:50]}...")
 
-            # Build task details
-            task_details = {
-                'subject': message_content[:200].strip(),
-                'description': f"""Task created via 👍 reaction
-
-Original message: "{message_content}"
-
-From: {msg_sender}
-Chat: {chat_jid}
-Time: {msg_timestamp}
-
-Created by: {sender} (reaction at {timestamp})
-""",
+            # Build detection dict in same format as AI-detected tasks
+            detection = {
+                'message_id': reacted_msg_id,
+                'subject': message_content[:130].strip(),
+                'type': 'reaction-task',
+                'confidence': 100,
                 'priority': 'Medium',
-                'has_details': True
+                'due_date': '',
+                'assignee_mentions': [],
+                'reasoning': 'Created via 👍 reaction',
+                'sender_name': msg_sender,
+                'sender_id': msg_sender,
+                'group_name': 'Direct Chat',
+                'group_jid': chat_jid,
+                'timestamp': msg_timestamp,
+                'original_message': {
+                    'content': message_content
+                },
+                'is_action_item': True
             }
 
-            # Create the task
-            result = create_erpnext_task(task_details)
+            # Build data dict for process_ai_task_approval
+            data = {
+                'detection': detection,
+                'recipient': authorized_user,
+                'task_num': task_num
+            }
 
-            if result.get('success'):
-                task_id = result.get('task_id', 'Unknown')
-                task_url = result.get('task_url', '')
-
-                success_msg = f"""✅ Task #{task_num} created from 👍 reaction!
-
-📋 Task ID: {task_id}
-📝 Subject: {message_content[:100]}...
-🔗 {task_url}"""
-
-                send_whatsapp_response(authorized_user, success_msg)
-                logger.info(f"Created task {task_id} from reaction")
-
-            else:
-                error = result.get('error', 'Unknown error')
-                send_whatsapp_response(
-                    authorized_user,
-                    f"❌ Failed to create task from 👍: {error}"
-                )
-                logger.error(f"Failed to create task from reaction: {error}")
+            # Use same task creation flow as numbered task approval
+            process_ai_task_approval(data, ai_detector)
 
     except Exception as e:
         logger.error(f"Error checking reaction tasks: {e}")

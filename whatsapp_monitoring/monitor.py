@@ -271,7 +271,7 @@ def get_recent_tagged_messages(last_check_time, tag=CLAUDE_TAG):
         
         # Query for tagged messages - handle timezone offset in timestamps
         query = """
-        SELECT 
+        SELECT
             m.timestamp,
             m.sender,
             c.name,
@@ -280,7 +280,7 @@ def get_recent_tagged_messages(last_check_time, tag=CLAUDE_TAG):
             m.id
         FROM messages m
         JOIN chats c ON m.chat_jid = c.jid
-        WHERE 
+        WHERE
             m.content LIKE ?
         ORDER BY m.timestamp ASC
         """
@@ -1170,19 +1170,20 @@ def check_reaction_tasks(ai_detector):
             since_time = last_reaction_check_time
 
         # Query for recent thumbs up reactions from ME (is_from_me = 1)
-        # Only in direct chats (not groups which end with @g.us)
+        # Only in MY OWN chat (authorized_user's personal chat)
+        my_chat_jid = f"{authorized_user}@s.whatsapp.net"
         query = """
         SELECT r.id, r.chat_jid, r.sender, r.emoji, r.timestamp, r.reacted_message_id
         FROM reactions r
         WHERE r.emoji = '👍'
             AND r.is_from_me = 1
-            AND r.chat_jid NOT LIKE '%@g.us'
+            AND r.chat_jid = ?
             AND datetime(substr(r.timestamp, 1, 19)) > datetime(?)
         ORDER BY r.timestamp ASC
         LIMIT 20
         """
 
-        cursor.execute(query, (since_time,))
+        cursor.execute(query, (my_chat_jid, since_time,))
         reactions = cursor.fetchall()
 
         if not reactions:
@@ -1858,10 +1859,16 @@ def main():
                 if task_messages:
                     # Process each Task message
                     for message in task_messages:
-                        logger.info(f"Processing Task request: {message[3][:50]}...")
+                        content = message[3]
+
+                        # Skip bot's own help template messages
+                        if "To create a task, use one of these formats" in content:
+                            logger.debug("Skipping bot help template message")
+                            continue
+
+                        logger.info(f"Processing Task request: {content[:50]}...")
 
                         # Check if the message already contains task details
-                        content = message[3]
                         task_details = extract_task_details(content)
 
                         if task_details.get('has_details', False):
